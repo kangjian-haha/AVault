@@ -634,7 +634,7 @@ private fun readSearchHistory(preferences: android.content.SharedPreferences): L
                                         val target = (player.currentPosition + delta).coerceIn(0L, maximum)
                                         player.seekTo(target)
                                         position = target
-                                        gestureKind = "feedback"
+                                        gestureKind = "seek"
                                         gestureText = if (tappedLeft) "快退 15 秒" else "快进 15 秒"
                                     } else {
                                         lastTapAt = now
@@ -659,7 +659,7 @@ private fun readSearchHistory(preferences: android.content.SharedPreferences): L
                             singleTapJob?.cancel()
                             lastTapAt = 0L
                             mode = if (abs(dx) >= abs(dy) * 1.2f) 1 else if (down.position.x < size.width / 2f) 2 else 3
-                            gestureKind = "feedback"
+                            gestureKind = if (mode == 1) "seek" else "feedback"
                             gestureActive = true
                             controlsVisible = false
                         }
@@ -686,20 +686,20 @@ private fun readSearchHistory(preferences: android.content.SharedPreferences): L
         })
         AnimatedVisibility(
             visible = gestureText != null,
-            modifier = if (gestureKind == "speed") Modifier.align(androidx.compose.ui.Alignment.TopCenter).padding(top = 18.dp) else Modifier.align(androidx.compose.ui.Alignment.Center),
+            modifier = if (gestureKind == "speed" || gestureKind == "seek") Modifier.align(androidx.compose.ui.Alignment.TopCenter).padding(top = 18.dp) else Modifier.align(androidx.compose.ui.Alignment.Center),
             enter = fadeIn(animationSpec = tween(80)),
             exit = fadeOut(animationSpec = tween(100))
         ) {
-            val speedPrompt = gestureKind == "speed"
+            val compactTopPrompt = gestureKind == "speed" || gestureKind == "seek"
             Surface(
-                color = androidx.compose.ui.graphics.Color.Black.copy(alpha = if (speedPrompt) .36f else .68f),
+                color = androidx.compose.ui.graphics.Color.Black.copy(alpha = if (compactTopPrompt) .36f else .68f),
                 contentColor = androidx.compose.ui.graphics.Color.White.copy(alpha = .9f),
-                shape = if (speedPrompt) MaterialTheme.shapes.small else MaterialTheme.shapes.medium
+                shape = if (compactTopPrompt) MaterialTheme.shapes.small else MaterialTheme.shapes.medium
             ) {
                 Text(
                     lastGestureText,
-                    modifier = Modifier.padding(horizontal = if (speedPrompt) 11.dp else 20.dp, vertical = if (speedPrompt) 5.dp else 12.dp),
-                    style = if (speedPrompt) MaterialTheme.typography.labelMedium else MaterialTheme.typography.titleMedium
+                    modifier = Modifier.padding(horizontal = if (compactTopPrompt) 11.dp else 20.dp, vertical = if (compactTopPrompt) 5.dp else 12.dp),
+                    style = if (compactTopPrompt) MaterialTheme.typography.labelMedium else MaterialTheme.typography.titleMedium
                 )
             }
         }
