@@ -80,7 +80,8 @@ import {
   SelectValue,
 } from "./components/ui/select";
 import { cn, formatBytes, formatDate } from "./lib/utils";
-import { IndependentToolsPage } from './ToolboxPage';
+import { IndependentToolsPage, type ToolboxSession } from './ToolboxPage';
+import { TaskDrawer, UnifiedTaskList, type UnifiedTask } from "./TaskCenter";
 
 type Section =
   | "all"
@@ -102,6 +103,33 @@ type SortMode =
   | "code-asc"
   | "title-asc";
 type GridCoverMode = "landscape" | "portrait";
+type ActorRoute = { name: string; sourceMovieId: string | null };
+type TagRoute = { name: string; sourceMovieId: string };
+type NavigationEntry = {
+  section: Section;
+  selectedId: string | null;
+  actorPage: ActorRoute | null;
+  tagPage: TagRoute | null;
+  libraryUnidentifiedOnly: boolean;
+  scrollTop: number;
+};
+type LibraryWorkspaceState = {
+  scrollTop: number;
+  search: string;
+  sort: SortMode;
+  watchFilter: "all" | WatchStatus;
+  sourcePartitionFilter: "all" | SourcePartition;
+  libraryUnidentifiedOnly: boolean;
+  view: "grid" | "list";
+  gridCoverMode: GridCoverMode;
+  actorSearch: string;
+};
+type SettingsWorkspaceState = { fc2CookieDraft: string | null; fc2CookieExpanded: boolean };
+
+const emptyToolboxSession = (): ToolboxSession => ({
+  tab: "merge", mergeFiles: [], transcodeFiles: [], probeFiles: [], probePath: null,
+  outputName: "合并影片", codec: "hevc", height: "keep", frameRate: "keep", cq: "23", maxBitrate: "",
+});
 
 function errorMessage(error: unknown): string {
   if (error instanceof Error)
@@ -111,7 +139,6 @@ function errorMessage(error: unknown): string {
     );
   return "操作失败，请稍后再试";
 }
-
 function ageFromBirthday(birthday: string | null | undefined): string {
   if (!birthday || !/^\d{4}-\d{2}-\d{2}$/.test(birthday)) return "未知";
   const [year, month, day] = birthday.split("-").map(Number);
@@ -188,6 +215,22 @@ function StatusBadge({ status }: { status: WatchStatus }) {
   } as const;
   return (
     <Badge className={cn("border-0", map[status][1])}>{map[status][0]}</Badge>
+  );
+}
+
+function BackNavigationHeader({ onBack, title, subtitle }: { onBack: () => void; title: string; subtitle: string }) {
+  return (
+    <header className="sticky top-0 z-30 flex items-center gap-4 border-b border-white/[0.055] bg-[#0e0f12]/85 px-8 py-4 backdrop-blur-xl">
+      <Button variant="ghost" onClick={onBack}>
+        <ArrowLeft className="size-4" />
+        返回上一页
+      </Button>
+      <div className="h-5 w-px bg-white/10" />
+      <div className="min-w-0">
+        <h1 className="truncate text-sm font-semibold text-zinc-200">{title}</h1>
+        <p className="text-xs text-zinc-600">{subtitle}</p>
+      </div>
+    </header>
   );
 }
 
@@ -349,7 +392,6 @@ function MovieCard({
     </div>
   );
 }
-
 function MovieDetailPage({
   movie,
   onBack,
@@ -731,7 +773,7 @@ function MovieDetailPage({
           <Button
             size="sm"
             variant="ghost"
-            onClick={() => window.avault.cancelTranscode()}
+            onClick={() => window.avault.cancelTranscode(transcode.fileId, transcode.kind)}
           >
             取消转码
           </Button>
@@ -2306,11 +2348,14 @@ function TagMoviesPage({
 function ActorLibraryPage({
   actors,
   onOpen,
+  search,
+  onSearchChange,
 }: {
   actors: Array<{ name: string; movieCount: number }>;
   onOpen: (actor: string) => void;
+  search: string;
+  onSearchChange: (value: string) => void;
 }) {
-  const [search, setSearch] = useState("");
   const [profiles, setProfiles] = useState<Record<string, ActorProfile | null>>(
     {},
   );
@@ -2355,7 +2400,7 @@ function ActorLibraryPage({
             <Search className="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-zinc-600" />
             <Input
               value={search}
-              onChange={(event) => setSearch(event.target.value)}
+              onChange={(event) => onSearchChange(event.target.value)}
               placeholder="搜索演员名称"
               className="pl-9"
             />
@@ -2568,140 +2613,6 @@ function DevicesPage({
             </div>
           )}
         </div>
-      </div>
-    </div>
-  );
-}
-
-function TasksPage({
-  snapshot,
-  tasks,
-  onChanged,
-  notify,
-}: {
-  snapshot: AppSnapshot;
-  tasks: TranscodeProgress[];
-  onChanged: () => Promise<void>;
-  notify: (message: string, error?: boolean) => void;
-}) {
-  async function remove(task: TranscodeProgress) {
-    try {
-      await window.avault.removeTranscodeTask(task.fileId, task.kind);
-      await onChanged();
-      notify("任务已移除");
-    } catch (error) {
-      notify(errorMessage(error), true);
-    }
-  }
-  const sorted = [...tasks].sort((a, b) =>
-    a.state === "running"
-      ? -1
-      : b.state === "running"
-        ? 1
-        : a.state === "queued"
-          ? -1
-          : b.state === "queued"
-            ? 1
-            : 0,
-  );
-  return (
-    <div className="mx-auto max-w-5xl p-8">
-      <div>
-        <h1 className="text-2xl font-bold">转码任务</h1>
-        <p className="mt-2 text-sm text-zinc-500">
-          任务按顺序执行，同一时间只会使用一个 NVIDIA 编码任务。
-        </p>
-      </div>
-      <div className="mt-8 space-y-3">
-        {sorted.length === 0 ? (
-          <div className="flex min-h-56 flex-col items-center justify-center rounded-2xl border border-dashed border-white/10 text-zinc-600">
-            <Archive className="mb-3 size-9" />
-            <p className="text-sm">暂无转码任务</p>
-          </div>
-        ) : (
-          sorted.map((task) => {
-            const file = snapshot.movies
-              .flatMap((movie) => movie.files)
-              .find((candidate) => candidate.id === task.fileId);
-            const label =
-              task.kind === "hevc"
-                ? "高清 HEVC · 2.5 Mbps"
-                : "720p HEVC · 1.5 Mbps";
-            const running = task.state === "running";
-            const queued = task.state === "queued";
-            return (
-              <div
-                key={`${task.fileId}:${task.kind}`}
-                className="rounded-xl border border-white/8 bg-white/[0.025] p-4"
-              >
-                <div className="flex items-start gap-4">
-                  <div
-                    className={cn(
-                      "rounded-lg p-2",
-                      running
-                        ? "bg-violet-500/15 text-violet-300"
-                        : queued
-                          ? "bg-amber-500/10 text-amber-300"
-                          : task.state === "completed"
-                            ? "bg-emerald-500/10 text-emerald-300"
-                            : "bg-red-500/10 text-red-300",
-                    )}
-                  >
-                    <Video className="size-5" />
-                  </div>
-                  <div className="min-w-0 flex-1">
-                    <div className="truncate font-medium text-zinc-200">
-                      {file?.name ?? "源文件已移除"}
-                    </div>
-                    <div className="mt-1 text-xs text-zinc-500">{label}</div>
-                    <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-white/8">
-                      <div
-                        className={cn(
-                          "h-full rounded-full transition-all",
-                          task.state === "failed"
-                            ? "bg-red-400"
-                            : task.state === "cancelled"
-                              ? "bg-zinc-500"
-                              : task.state === "completed"
-                                ? "bg-emerald-400"
-                                : "bg-violet-400",
-                        )}
-                        style={{ width: `${task.percent ?? 0}%` }}
-                      />
-                    </div>
-                    <div className="mt-2 text-xs text-zinc-500">
-                      {running
-                        ? `正在转码 ${task.percent?.toFixed(1) ?? 0}%${task.speed ? ` · ${task.speed}` : ""}${task.etaSeconds ? ` · 预计剩余 ${Math.ceil(task.etaSeconds)} 秒` : ""}`
-                        : queued
-                          ? "等待前方任务完成"
-                          : (task.message ??
-                            (task.state === "completed"
-                              ? "转码完成"
-                              : "任务已取消"))}
-                    </div>
-                  </div>
-                  {running ? (
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      onClick={() => window.avault.cancelTranscode()}
-                    >
-                      取消
-                    </Button>
-                  ) : (
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      onClick={() => remove(task)}
-                    >
-                      {queued ? "移出队列" : "移除"}
-                    </Button>
-                  )}
-                </div>
-              </div>
-            );
-          })
-        )}
       </div>
     </div>
   );
@@ -3018,120 +2929,18 @@ function AiCenterPage({
   );
 }
 
-/* Legacy library-bound tool UI kept only as source context while the independent tool UI below replaces it.
-  const [selected, setSelected] = useState<string[]>([]);
-  const [query, setQuery] = useState("");
-  const [outputName, setOutputName] = useState("合并影片");
-  const [progress, setProgress] = useState<MergeProgress | null>(null);
-  const files = useMemo(() => snapshot.movies.flatMap((movie) => movie.files.filter((file) => file.available).map((file) => ({ ...file, code: movie.normalizedCode ?? movie.code ?? movie.title }))).filter((file) => `${file.code} ${file.name}`.toLowerCase().includes(query.toLowerCase())), [snapshot.movies, query]);
-  const selectedFiles = useMemo(() => snapshot.movies.flatMap((movie) => movie.files.filter((file) => selected.includes(file.id))), [snapshot.movies, selected]);
-  const compatible = selectedFiles.length < 2 || selectedFiles.every((file) => {
-    const first = selectedFiles[0].mediaInfo;
-    const current = file.mediaInfo;
-    return first && current && first.container === current.container && first.videoCodec === current.videoCodec && first.width === current.width && first.height === current.height && first.frameRate === current.frameRate && first.audioCodec === current.audioCodec && first.audioChannels === current.audioChannels;
-  });
-  useEffect(() => window.avault.onMergeProgress(setProgress), []);
-  function toggle(fileId: string) { setSelected((current) => current.includes(fileId) ? current.filter((id) => id !== fileId) : [...current, fileId]); }
-  function moveSelected(fileId: string, direction: -1 | 1) { setSelected((current) => { const index = current.indexOf(fileId); const next = index + direction; if (index < 0 || next < 0 || next >= current.length) return current; const reordered = [...current]; [reordered[index], reordered[next]] = [reordered[next], reordered[index]]; return reordered; }); }
-  async function merge(mode: "copy" | "hevc") {
-    if (selectedFiles.length < 2) return notify("请至少选择两个视频文件", true);
-    if (new Set(selectedFiles.map((file) => file.libraryId)).size !== 1) return notify("请只选择同一个媒体文件夹内的文件", true);
-    if (!outputName.trim()) return notify("请填写输出文件名", true);
-    if (mode === "copy" && !compatible) return notify("无损合并要求编码、分辨率、帧率和音频参数一致；请改用转码合并", true);
-    try { await window.avault.startMerge(selected, outputName.trim(), mode); await refresh(); notify("合并完成，已重新扫描媒体库"); setSelected([]); }
-    catch (error) { notify(errorMessage(error), true); }
-  }
-  return <div className="mx-auto max-w-6xl px-8 py-8">
-    <div className="flex items-start justify-between gap-5"><div><h1 className="text-2xl font-bold">工具箱</h1><p className="mt-1 text-sm text-zinc-600">合并同一影片的分段文件。默认无损，不会修改原始文件。</p></div><Badge className="border-violet-500/25 bg-violet-500/10 text-violet-200">FFmpeg</Badge></div>
-    <div className="mt-7 grid gap-6 lg:grid-cols-[1fr_360px]"><section className="rounded-2xl border border-white/[0.08] bg-white/[0.025] p-5"><div className="flex items-center justify-between gap-3"><h2 className="font-semibold">选择并排序视频</h2><Input className="h-8 w-56" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索番号或文件名" /></div><p className="mt-1 text-xs text-zinc-600">选中的顺序即合并顺序；先选择的文件排在最前。</p><div className="mt-4 max-h-[52vh] overflow-y-auto rounded-xl border border-white/[0.07]">{files.map((file) => <button key={file.id} type="button" onClick={() => toggle(file.id)} className={cn("flex w-full items-center gap-3 border-b border-white/[0.055] px-4 py-3 text-left last:border-0", selected.includes(file.id) ? "bg-violet-500/10" : "hover:bg-white/[0.035]")}><span className={cn("grid size-5 place-items-center rounded border text-xs", selected.includes(file.id) ? "border-violet-400 bg-violet-500 text-white" : "border-zinc-700 text-transparent")}>✓</span><Video className="size-4 shrink-0 text-violet-300" /><span className="min-w-0 flex-1"><span className="block truncate text-sm text-zinc-200">{file.name}</span><span className="block truncate text-xs text-zinc-600">{file.code} · {formatBytes(file.size)} · {file.mediaInfo?.videoCodec?.toUpperCase() ?? "未检测"}</span></span>{selected.includes(file.id) && <span className="text-xs text-violet-200">第 {selected.indexOf(file.id) + 1} 段</span>}</button>)}{files.length === 0 && <div className="grid h-32 place-items-center text-sm text-zinc-600">没有匹配的视频</div>}</div></section>
-    <aside className="h-fit rounded-2xl border border-white/[0.08] bg-white/[0.025] p-5"><h2 className="font-semibold">合并设置</h2><div className="mt-4 text-sm text-zinc-400">已选择 <span className="font-semibold text-white">{selected.length}</span> 个文件</div>{selectedFiles.length > 0 && <div className="mt-3 overflow-hidden rounded-lg border border-white/[0.07]">{selectedFiles.map((file, index) => <div key={file.id} className="flex items-center gap-2 border-b border-white/[0.055] px-2 py-2 text-xs last:border-0"><span className="text-violet-300">{index + 1}</span><span className="min-w-0 flex-1 truncate text-zinc-300">{file.name}</span><button type="button" disabled={index === 0} onClick={() => moveSelected(file.id, -1)} className="text-zinc-500 hover:text-white disabled:opacity-20"><ArrowUp className="size-3" /></button><button type="button" disabled={index === selectedFiles.length - 1} onClick={() => moveSelected(file.id, 1)} className="text-zinc-500 hover:text-white disabled:opacity-20"><ArrowDown className="size-3" /></button></div>)}</div>}<Input className="mt-4" value={outputName} onChange={(event) => setOutputName(event.target.value)} placeholder="输出文件名" /><p className="mt-2 text-xs leading-5 text-zinc-600">输出到第一段视频的同级目录，扩展名固定为 .mp4；同名文件不会覆盖。</p><div className={cn("mt-4 rounded-lg border p-3 text-xs", compatible ? "border-emerald-500/20 bg-emerald-500/[0.06] text-emerald-200" : "border-amber-500/20 bg-amber-500/[0.06] text-amber-200")}>{compatible ? "媒体参数一致：可无损合并。" : "媒体参数不同：无损合并不可用，建议使用转码合并。"}</div>{progress && <div className="mt-4 rounded-lg bg-black/20 p-3 text-xs text-zinc-400">{progress.state === "running" ? `正在合并 ${progress.percent?.toFixed(1) ?? 0}%${progress.speed ? ` · ${progress.speed}` : ""}` : progress.message}</div>}<div className="mt-5 space-y-2"><Button className="w-full" disabled={selected.length < 2 || !compatible || progress?.state === "running"} onClick={() => merge("copy")}>无损合并</Button><Button variant="outline" className="w-full" disabled={selected.length < 2 || progress?.state === "running" || !snapshot.settings.ffmpeg.nvencAvailable} onClick={() => merge("hevc")}>转码合并为 HEVC</Button></div><p className="mt-4 text-xs leading-5 text-zinc-600">转码合并使用 NVIDIA HEVC，输出约 2.5 Mbps；合并过程可在运行日志中查看完整命令。</p></aside></div></div>
-}
-
-*/
-/* Compact initial independent tool implementation retained as a comment while the clearer panel below supersedes it.
-  const [tab, setTab] = useState<"merge" | "transcode">("merge"); const [files, setFiles] = useState<ToolFile[]>([]); const [tasks, setTasks] = useState<ToolTask[]>([]); const [outputName, setOutputName] = useState("合并影片"); const [codec, setCodec] = useState<ToolEncodeOptions["codec"]>("hevc"); const [height, setHeight] = useState("保持原分辨率"); const [bitrate, setBitrate] = useState("2500");
-  const options = (): ToolEncodeOptions => ({ codec, height: height === "保持原分辨率" ? null : Number(height), bitrateKbps: Number(bitrate) });
-  const addPaths = async (paths: string[]) => { const added = await window.avault.inspectToolFiles(paths); setFiles((current) => [...current, ...added.filter((item) => !current.some((known) => known.path === item.path))]); };
-  useEffect(() => { void window.avault.getToolTasks().then(setTasks); return window.avault.onToolTaskProgress((task) => setTasks((current) => { const index = current.findIndex((item) => item.id === task.id); return index < 0 ? [...current, task] : current.map((item) => item.id === task.id ? task : item); })); }, []);
-  const compatible = files.length < 2 || files.every((file) => { const first = files[0].mediaInfo; const info = file.mediaInfo; return first && info && first.container === info.container && first.videoCodec === info.videoCodec && first.width === info.width && first.height === info.height && first.frameRate === info.frameRate && first.audioCodec === info.audioCodec && first.audioChannels === info.audioChannels; });
-  const choose = async () => { const added = await window.avault.chooseToolFiles(); setFiles((current) => [...current, ...added.filter((item) => !current.some((known) => known.path === item.path))]); };
-  const drop = async (event: React.DragEvent) => { event.preventDefault(); await addPaths(Array.from(event.dataTransfer.files).map((file) => window.avault.getDroppedFilePath(file)).filter(Boolean)); };
-  const move = (index: number, direction: -1 | 1) => setFiles((current) => { const target = index + direction; if (target < 0 || target >= current.length) return current; const next = [...current]; [next[index], next[target]] = [next[target], next[index]]; return next; });
-  const runMerge = async (mode: "copy" | "transcode") => { if (files.length < 2 || !outputName.trim()) return notify("请添加至少两个文件并填写输出名称", true); if (mode === "copy" && !compatible) return notify("文件参数不一致，不能无损合并", true); try { await window.avault.startToolMerge(files.map((file) => file.path), outputName, mode, options()); notify("已加入工具箱任务队列"); } catch (error) { notify(errorMessage(error), true); } };
-  const runTranscode = async () => { if (!files.length) return notify("请先添加视频文件", true); try { await window.avault.startToolTranscode(files.map((file) => file.path), options()); notify(`已加入 ${files.length} 个转码任务`); } catch (error) { notify(errorMessage(error), true); } };
-  return <div className="mx-auto max-w-6xl px-8 py-8"><div className="flex items-start justify-between"><div><h1 className="text-2xl font-bold">工具箱</h1><p className="mt-1 text-sm text-zinc-600">独立处理本地视频，不关联 AVault 媒体库。</p></div><Badge className="border-violet-500/25 bg-violet-500/10 text-violet-200">FFmpeg</Badge></div><div className="mt-6 flex gap-2"><Button variant={tab === "merge" ? "default" : "outline"} onClick={() => setTab("merge")}>合并视频</Button><Button variant={tab === "transcode" ? "default" : "outline"} onClick={() => setTab("transcode")}>转码视频</Button></div><div onDragOver={(event) => event.preventDefault()} onDrop={drop} className="mt-5 grid min-h-36 place-items-center rounded-2xl border border-dashed border-violet-400/35 bg-violet-500/[0.04] p-6 text-center"><div><Video className="mx-auto size-7 text-violet-300" /><div className="mt-2 font-medium">拖入视频文件到这里</div><div className="mt-1 text-xs text-zinc-600">支持 MP4、MKV、AVI、MOV、WMV、M4V、TS</div><Button variant="outline" className="mt-3" onClick={choose}>选择文件</Button></div></div><div className="mt-6 grid gap-6 lg:grid-cols-[1fr_340px]"><section className="rounded-2xl border border-white/[0.08] bg-white/[0.025] p-4"><div className="flex items-center justify-between"><h2 className="font-semibold">{tab === "merge" ? "合并顺序" : "待转码文件"}</h2><span className="text-xs text-zinc-600">{files.length} 个文件</span></div><div className="mt-3 max-h-[42vh] overflow-y-auto rounded-xl border border-white/[0.07]">{files.map((file, index) => <div key={file.path} className="flex items-center gap-3 border-b border-white/[0.055] px-3 py-3 last:border-0"><span className="w-5 text-center text-xs text-violet-300">{tab === "merge" ? index + 1 : ""}</span><Video className="size-4 text-violet-300" /><span className="min-w-0 flex-1"><span className="block truncate text-sm">{file.name}</span><span className="block text-xs text-zinc-600">{formatBytes(file.size)} · {file.mediaInfo?.videoCodec?.toUpperCase() ?? "未检测"} · {file.mediaInfo?.width ?? "?"}×{file.mediaInfo?.height ?? "?"}</span></span>{tab === "merge" && <><button disabled={index === 0} onClick={() => move(index, -1)} className="text-zinc-500 disabled:opacity-20"><ArrowUp className="size-4" /></button><button disabled={index === files.length - 1} onClick={() => move(index, 1)} className="text-zinc-500 disabled:opacity-20"><ArrowDown className="size-4" /></button></>}<button onClick={() => setFiles((current) => current.filter((item) => item.path !== file.path))} className="text-zinc-500 hover:text-rose-300"><X className="size-4" /></button></div>)}{files.length === 0 && <div className="grid h-40 place-items-center text-sm text-zinc-600">尚未添加文件</div>}</div></section><aside className="h-fit rounded-2xl border border-white/[0.08] bg-white/[0.025] p-5"><h2 className="font-semibold">{tab === "merge" ? "合并设置" : "转码设置"}</h2>{tab === "merge" && <><Input className="mt-4" value={outputName} onChange={(event) => setOutputName(event.target.value)} placeholder="输出文件名" /><div className={cn("mt-3 rounded-lg border p-3 text-xs", compatible ? "border-emerald-500/20 text-emerald-200" : "border-amber-500/20 text-amber-200")}>{compatible ? "参数一致，可无损合并。" : "参数不一致，请使用转码合并。"}</div></>}<div className="mt-4 grid grid-cols-2 gap-2"><Select value={codec} onValueChange={(value) => { setCodec(value as ToolEncodeOptions["codec"]); if (value === "h264" && bitrate === "2500") setBitrate("4000"); }}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectItem value="hevc">H.265 / HEVC</SelectItem><SelectItem value="h264">H.264</SelectItem></SelectContent></Select><Select value={height} onValueChange={setHeight}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectItem value="保持原分辨率">保持原分辨率</SelectItem><SelectItem value="720">720p</SelectItem><SelectItem value="1080">1080p</SelectItem></SelectContent></Select></div><Input className="mt-2" value={bitrate} onChange={(event) => setBitrate(event.target.value)} inputMode="numeric" placeholder="视频码率 kbps" /><p className="mt-2 text-xs text-zinc-600">音频固定 AAC 160 kbps / 双声道，输出为 MP4。</p>{tab === "merge" ? <div className="mt-5 space-y-2"><Button className="w-full" disabled={files.length < 2 || !compatible} onClick={() => runMerge("copy")}>无损合并</Button><Button variant="outline" className="w-full" disabled={files.length < 2 || !snapshot.settings.ffmpeg.nvencAvailable} onClick={() => runMerge("transcode")}>转码合并</Button></div> : <Button className="mt-5 w-full" disabled={!files.length || !snapshot.settings.ffmpeg.nvencAvailable} onClick={runTranscode}>加入转码队列</Button>}</aside></div><section className="mt-6 rounded-2xl border border-white/[0.08] bg-white/[0.025] p-4"><h2 className="font-semibold">工具箱任务</h2><div className="mt-3 space-y-2">{tasks.slice().reverse().map((task) => <div key={task.id} className="flex items-center gap-3 rounded-lg bg-black/20 px-3 py-2 text-sm"><span className="min-w-0 flex-1 truncate">{task.outputName}</span><span className="text-xs text-zinc-500">{task.state === "running" ? `${task.percent?.toFixed(1) ?? 0}% ${task.speed ?? ""}` : task.message ?? task.state}</span>{["queued", "running"].includes(task.state) ? <Button variant="ghost" size="sm" onClick={() => window.avault.cancelToolTask(task.id)}>取消</Button> : <Button variant="ghost" size="sm" onClick={() => window.avault.removeToolTask(task.id).then(() => setTasks((current) => current.filter((item) => item.id !== task.id)))}>移除</Button>}</div>)}{tasks.length === 0 && <div className="py-5 text-sm text-zinc-600">暂无工具箱任务</div>}</div></section></div>
-}
-
-*/
-/* Previous compact rendition.
-  const [tab, setTab] = useState<"merge" | "transcode">("merge");
-  const [files, setFiles] = useState<ToolFile[]>([]); const [tasks, setTasks] = useState<ToolTask[]>([]);
-  const [outputName, setOutputName] = useState("合并影片"); const [codec, setCodec] = useState<ToolEncodeOptions["codec"]>("hevc"); const [height, setHeight] = useState("keep"); const [bitrate, setBitrate] = useState("2500");
-  const options = (): ToolEncodeOptions => ({ codec, height: height === "keep" ? null : Number(height), bitrateKbps: Number(bitrate) });
-  const append = (incoming: ToolFile[]) => setFiles((current) => [...current, ...incoming.filter((item) => !current.some((known) => known.path === item.path))]);
-  useEffect(() => { void window.avault.getToolTasks().then(setTasks); return window.avault.onToolTaskProgress((task) => setTasks((current) => { const i = current.findIndex((item) => item.id === task.id); return i < 0 ? [...current, task] : current.map((item) => item.id === task.id ? task : item); })); }, []);
-  const compatible = files.length < 2 || files.every((file) => { const a = files[0].mediaInfo; const b = file.mediaInfo; return a && b && a.container === b.container && a.videoCodec === b.videoCodec && a.width === b.width && a.height === b.height && a.frameRate === b.frameRate && a.audioCodec === b.audioCodec && a.audioChannels === b.audioChannels; });
-  const addDialog = async () => append(await window.avault.chooseToolFiles());
-  const drop = async (event: React.DragEvent) => { event.preventDefault(); append(await window.avault.inspectToolFiles(Array.from(event.dataTransfer.files).map((file) => window.avault.getDroppedFilePath(file)))); };
-  const move = (index: number, offset: -1 | 1) => setFiles((current) => { const next = index + offset; if (next < 0 || next >= current.length) return current; const result = [...current]; [result[index], result[next]] = [result[next], result[index]]; return result; });
-  const queueMerge = async (mode: "copy" | "transcode") => { try { if (files.length < 2 || !outputName.trim()) throw new Error("请添加至少两个文件并填写输出名称"); if (mode === "copy" && !compatible) throw new Error("文件参数不一致，不能无损合并"); await window.avault.startToolMerge(files.map((file) => file.path), outputName, mode, options()); notify("已加入工具箱任务队列"); } catch (error) { notify(errorMessage(error), true); } };
-  const queueTranscode = async () => { try { if (!files.length) throw new Error("请先添加视频文件"); await window.avault.startToolTranscode(files.map((file) => file.path), options()); notify(`已加入 ${files.length} 个转码任务`); } catch (error) { notify(errorMessage(error), true); } };
-  const settings = <><div className="mt-5 border-t border-white/[0.07] pt-4"><div className="text-sm font-medium text-zinc-200">转码参数</div><p className="mt-1 text-xs leading-5 text-zinc-600">只在“转码合并”或“转码视频”时生效；无损合并不会重新编码。</p></div><label className="mt-4 block text-xs text-zinc-500">视频编码</label><Select value={codec} onValueChange={(value) => { setCodec(value as ToolEncodeOptions["codec"]); if (value === "h264" && bitrate === "2500") setBitrate("4000"); }}><SelectTrigger className="mt-1"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="hevc">H.265 / HEVC（体积更小）</SelectItem><SelectItem value="h264">H.264（兼容性更好）</SelectItem></SelectContent></Select><label className="mt-3 block text-xs text-zinc-500">输出分辨率</label><Select value={height} onValueChange={setHeight}><SelectTrigger className="mt-1"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="keep">保持原分辨率</SelectItem><SelectItem value="720">最高 720p</SelectItem><SelectItem value="1080">最高 1080p</SelectItem></SelectContent></Select><label className="mt-3 block text-xs text-zinc-500">视频码率（kbps）</label><Input className="mt-1" value={bitrate} onChange={(event) => setBitrate(event.target.value)} inputMode="numeric" /><p className="mt-1 text-xs leading-5 text-zinc-600">数值越低，体积越小、画质越低。H.265 建议 2500；H.264 建议 4000。音频固定 AAC 160 kbps / 双声道。</p></>;
-  return <div className="mx-auto max-w-6xl px-8 py-8"><div className="flex items-start justify-between"><div><h1 className="text-2xl font-bold">工具箱</h1><p className="mt-1 text-sm text-zinc-600">独立处理任意本地视频，不会写入媒体库。</p></div><Badge className="border-violet-500/25 bg-violet-500/10 text-violet-200">FFmpeg</Badge></div><div className="mt-6 flex rounded-xl border border-white/[0.08] bg-black/20 p-1"><Button size="sm" variant={tab === "merge" ? "default" : "ghost"} onClick={() => setTab("merge")}>合并视频</Button><Button size="sm" variant={tab === "transcode" ? "default" : "ghost"} onClick={() => setTab("transcode")}>转码视频</Button></div><div onDragOver={(event) => event.preventDefault()} onDrop={drop} className="mt-5 grid min-h-32 place-items-center rounded-2xl border border-dashed border-violet-400/35 bg-violet-500/[0.04] p-5 text-center"><div><Video className="mx-auto size-6 text-violet-300" /><div className="mt-2 text-sm font-medium">拖入视频文件，或从资源管理器选择</div><Button variant="outline" size="sm" className="mt-3" onClick={addDialog}>选择文件</Button></div></div><div className="mt-6 grid gap-6 lg:grid-cols-[1fr_360px]"><section className="rounded-2xl border border-white/[0.08] bg-white/[0.025] p-4"><div className="flex items-center justify-between"><div><h2 className="font-semibold">{tab === "merge" ? "合并顺序" : "待转码文件"}</h2><p className="mt-1 text-xs text-zinc-600">{tab === "merge" ? "数字决定播放与合并顺序，可用箭头调整。" : "每个文件会独立输出到自己的同级目录。"}</p></div><Badge variant="secondary">{files.length} 个</Badge></div><div className="mt-4 h-[40vh] overflow-y-auto rounded-xl border border-white/[0.07]">{files.map((file, index) => <div key={file.path} className="flex items-center gap-3 border-b border-white/[0.055] px-3 py-3 last:border-0"><span className="w-5 text-center text-xs text-violet-300">{tab === "merge" ? index + 1 : ""}</span><Video className="size-4 shrink-0 text-violet-300" /><span className="min-w-0 flex-1"><span className="block truncate text-sm text-zinc-200">{file.name}</span><span className="block text-xs text-zinc-600">{formatBytes(file.size)} · {file.mediaInfo?.videoCodec?.toUpperCase() ?? "未检测"} · {file.mediaInfo?.width ?? "?"}×{file.mediaInfo?.height ?? "?"}</span></span>{tab === "merge" && <><button disabled={!index} onClick={() => move(index, -1)} className="text-zinc-500 disabled:opacity-20"><ArrowUp className="size-4" /></button><button disabled={index === files.length - 1} onClick={() => move(index, 1)} className="text-zinc-500 disabled:opacity-20"><ArrowDown className="size-4" /></button></>}<button onClick={() => setFiles((current) => current.filter((item) => item.path !== file.path))} className="text-zinc-500 hover:text-rose-300"><X className="size-4" /></button></div>)}{!files.length && <div className="grid h-full place-items-center text-sm text-zinc-600">尚未添加文件</div>}</div></section><aside className="h-fit rounded-2xl border border-white/[0.08] bg-white/[0.025] p-5"><h2 className="font-semibold">{tab === "merge" ? "合并设置" : "转码设置"}</h2>{tab === "merge" && <><label className="mt-4 block text-xs text-zinc-500">输出文件名</label><Input className="mt-1" value={outputName} onChange={(event) => setOutputName(event.target.value)} /><p className="mt-1 text-xs text-zinc-600">保存到第一段视频同级目录，不覆盖已有文件。</p><div className={cn("mt-4 rounded-xl border p-3 text-xs", compatible ? "border-emerald-500/25 bg-emerald-500/[0.06] text-emerald-200" : "border-amber-500/25 bg-amber-500/[0.06] text-amber-200")}>{compatible ? "参数一致：可无损合并，速度快且不会损失画质。" : "参数不一致：请使用转码合并，将统一编码与分辨率。"}</div></>}{settings}{tab === "merge" ? <div className="mt-5 grid gap-2"><Button disabled={files.length < 2 || !compatible} onClick={() => queueMerge("copy")}>无损合并</Button><Button variant="outline" disabled={files.length < 2 || !snapshot.settings.ffmpeg.nvencAvailable} onClick={() => queueMerge("transcode")}>转码合并</Button></div> : <Button className="mt-5 w-full" disabled={!files.length || !snapshot.settings.ffmpeg.nvencAvailable} onClick={queueTranscode}>加入转码队列</Button>}</aside></div><section className="mt-6 rounded-2xl border border-white/[0.08] bg-white/[0.025] p-4"><h2 className="font-semibold">工具箱任务</h2><div className="mt-3 space-y-2">{tasks.slice().reverse().map((task) => <div key={task.id} className="flex items-center gap-3 rounded-lg bg-black/20 px-3 py-2 text-sm"><span className="min-w-0 flex-1 truncate">{task.outputName}</span><span className="text-xs text-zinc-500">{task.state === "running" ? `${task.percent?.toFixed(1) ?? 0}% ${task.speed ?? ""}` : task.message ?? task.state}</span>{["queued", "running"].includes(task.state) ? <Button variant="ghost" size="sm" onClick={() => window.avault.cancelToolTask(task.id)}>取消</Button> : <Button variant="ghost" size="sm" onClick={() => window.avault.removeToolTask(task.id).then(() => setTasks((current) => current.filter((item) => item.id !== task.id))}>移除</Button>}</div>)}{!tasks.length && <div className="py-5 text-sm text-zinc-600">暂无工具箱任务</div>}</div></section></div>
-}
-
-*/
-/* Previous tools layout.
-  const [tab, setTab] = useState<'merge' | 'transcode'>('merge')
-  const [files, setFiles] = useState<ToolFile[]>([])
-  const [outputName, setOutputName] = useState('合并影片')
-  const [codec, setCodec] = useState<ToolEncodeOptions['codec']>('hevc')
-  const [height, setHeight] = useState('keep')
-  const [bitrate, setBitrate] = useState('2500')
-  const options = (): ToolEncodeOptions => ({ codec, height: height === 'keep' ? null : Number(height), bitrateKbps: Number(bitrate) })
-  const append = (added: ToolFile[]) => setFiles((current) => [...current, ...added.filter((item) => !current.some((known) => known.path === item.path))])
-  const compatible = files.length < 2 || files.every((file) => { const a = files[0].mediaInfo; const b = file.mediaInfo; return Boolean(a && b && a.container === b.container && a.videoCodec === b.videoCodec && a.width === b.width && a.height === b.height && a.frameRate === b.frameRate && a.audioCodec === b.audioCodec && a.audioChannels === b.audioChannels) })
-  const choose = async () => append(await window.avault.chooseToolFiles())
-  const drop = async (event: React.DragEvent) => { event.preventDefault(); append(await window.avault.inspectToolFiles(Array.from(event.dataTransfer.files).map((file) => window.avault.getDroppedFilePath(file)))) }
-  const run = async (mode: 'copy' | 'transcode') => { try { await window.avault.startToolMerge(files.map((file) => file.path), outputName, mode, options()); notify('已加入工具箱任务队列') } catch (error) { notify(errorMessage(error), true) } }
-  const runTranscode = async () => { try { await window.avault.startToolTranscode(files.map((file) => file.path), options()); notify('已加入转码任务队列') } catch (error) { notify(errorMessage(error), true) } }
-  return <div className="mx-auto max-w-6xl px-8 py-8"><h1 className="text-2xl font-bold">工具箱</h1><p className="mt-1 text-sm text-zinc-600">独立处理本地视频，不会写入 AVault 媒体库。</p><div className="mt-6 flex rounded-xl border border-white/[0.08] bg-black/20 p-1 w-fit"><Button size="sm" variant={tab === 'merge' ? 'default' : 'ghost'} onClick={() => setTab('merge')}>合并视频</Button><Button size="sm" variant={tab === 'transcode' ? 'default' : 'ghost'} onClick={() => setTab('transcode')}>转码视频</Button></div><div onDragOver={(event) => event.preventDefault()} onDrop={drop} className="mt-5 grid min-h-32 place-items-center rounded-2xl border border-dashed border-violet-400/35 bg-violet-500/[0.04] p-5 text-center"><div><Video className="mx-auto size-6 text-violet-300" /><div className="mt-2 text-sm font-medium">拖入视频文件到这里</div><Button variant="outline" size="sm" className="mt-3" onClick={choose}>选择文件</Button></div></div><div className="mt-6 grid gap-6 lg:grid-cols-[1fr_360px]"><section className="rounded-2xl border border-white/[0.08] bg-white/[0.025] p-4"><div className="flex items-center justify-between"><div><h2 className="font-semibold">{tab === 'merge' ? '合并顺序' : '待转码文件'}</h2><p className="mt-1 text-xs text-zinc-600">{tab === 'merge' ? '上方为第一段；可通过删除后重新添加调整顺序。' : '每个文件都会输出在自己的同级目录。'}</p></div><Badge variant="secondary">{files.length} 个</Badge></div><div className="mt-4 h-[40vh] overflow-y-auto rounded-xl border border-white/[0.07]">{files.map((file, index) => <div key={file.path} className="flex items-center gap-3 border-b border-white/[0.055] px-3 py-3 last:border-0"><span className="w-5 text-center text-xs text-violet-300">{tab === 'merge' ? index + 1 : ''}</span><Video className="size-4 text-violet-300" /><span className="min-w-0 flex-1"><span className="block truncate text-sm">{file.name}</span><span className="block text-xs text-zinc-600">{formatBytes(file.size)} · {file.mediaInfo?.videoCodec?.toUpperCase() ?? '未检测'} · {file.mediaInfo?.width ?? '?'}×{file.mediaInfo?.height ?? '?'}</span></span><button onClick={() => setFiles((current) => current.filter((item) => item.path !== file.path))} className="text-zinc-500 hover:text-rose-300"><X className="size-4" /></button></div>)}{files.length === 0 && <div className="grid h-full place-items-center text-sm text-zinc-600">尚未添加文件</div>}</div></section><aside className="h-fit rounded-2xl border border-white/[0.08] bg-white/[0.025] p-5"><h2 className="font-semibold">{tab === 'merge' ? '合并设置' : '转码设置'}</h2>{tab === 'merge' && <><label className="mt-4 block text-xs text-zinc-500">输出文件名</label><Input className="mt-1" value={outputName} onChange={(event) => setOutputName(event.target.value)} /><div className={cn('mt-4 rounded-xl border p-3 text-xs', compatible ? 'border-emerald-500/25 bg-emerald-500/[0.06] text-emerald-200' : 'border-amber-500/25 bg-amber-500/[0.06] text-amber-200')}>{compatible ? '参数一致：可无损合并，速度快且不损失画质。' : '参数不一致：请使用转码合并。'}</div></>}<div className="mt-5 border-t border-white/[0.07] pt-4"><div className="text-sm font-medium">转码参数</div><p className="mt-1 text-xs text-zinc-600">仅用于转码合并或转码视频；无损合并不会使用。</p></div><label className="mt-4 block text-xs text-zinc-500">视频编码</label><Select value={codec} onValueChange={(value) => setCodec(value as ToolEncodeOptions['codec'])}><SelectTrigger className="mt-1"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="hevc">H.265 / HEVC（体积更小）</SelectItem><SelectItem value="h264">H.264（兼容性更好）</SelectItem></SelectContent></Select><label className="mt-3 block text-xs text-zinc-500">输出分辨率</label><Select value={height} onValueChange={setHeight}><SelectTrigger className="mt-1"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="keep">保持原分辨率</SelectItem><SelectItem value="720">最高 720p</SelectItem><SelectItem value="1080">最高 1080p</SelectItem></SelectContent></Select><label className="mt-3 block text-xs text-zinc-500">视频码率（kbps）</label><Input className="mt-1" value={bitrate} onChange={(event) => setBitrate(event.target.value)} inputMode="numeric" /><p className="mt-1 text-xs text-zinc-600">越低体积越小、画质越低。H.265 建议 2500；H.264 建议 4000。</p>{tab === 'merge' ? <div className="mt-5 grid gap-2"><Button disabled={files.length < 2 || !compatible} onClick={() => run('copy')}>无损合并</Button><Button variant="outline" disabled={files.length < 2 || !snapshot.settings.ffmpeg.nvencAvailable} onClick={() => run('transcode')}>转码合并</Button></div> : <Button className="mt-5 w-full" disabled={!files.length || !snapshot.settings.ffmpeg.nvencAvailable} onClick={runTranscode}>加入转码队列</Button>}</aside></div></div>
-}
-
-*/
-/* Superseded by IndependentToolsPage in ToolboxPage.tsx.
-  const [tab, setTab] = useState<'merge' | 'transcode' | 'probe'>('merge')
-  const [files, setFiles] = useState<ToolFile[]>([])
-  const [selectedPath, setSelectedPath] = useState<string | null>(null)
-  const [outputName, setOutputName] = useState('合并影片')
-  const [codec, setCodec] = useState<ToolEncodeOptions['codec']>('hevc')
-  const [height, setHeight] = useState('keep')
-  const [bitrate, setBitrate] = useState('2500')
-  const [tasks, setTasks] = useState<ToolTask[]>([])
-  const options = (): ToolEncodeOptions => ({ codec, height: height === 'keep' ? null : Number(height), bitrateKbps: Number(bitrate) })
-  const append = (added: ToolFile[]) => setFiles((current) => { const next = [...current, ...added.filter((item) => !current.some((known) => known.path === item.path))]; setSelectedPath(next[0]?.path ?? null); return next })
-  const selected = files.find((file) => file.path === selectedPath) ?? files[0] ?? null
-  const compatible = files.length < 2 || files.every((file) => { const a = files[0].mediaInfo; const b = file.mediaInfo; return Boolean(a && b && a.container === b.container && a.videoCodec === b.videoCodec && a.width === b.width && a.height === b.height && a.frameRate === b.frameRate && a.audioCodec === b.audioCodec && a.audioChannels === b.audioChannels) })
-  useEffect(() => { void window.avault.getToolTasks().then(setTasks); return window.avault.onToolTaskProgress((task) => setTasks((current) => { const i = current.findIndex((item) => item.id === task.id); return i < 0 ? [...current, task] : current.map((item) => item.id === task.id ? task : item) })) }, [])
-  const choose = async () => { append(await window.avault.chooseToolFiles()); setTab('probe') }
-  const drop = async (event: React.DragEvent) => { event.preventDefault(); append(await window.avault.inspectToolFiles(Array.from(event.dataTransfer.files).map((file) => window.avault.getDroppedFilePath(file)))); setTab('probe') }
-  const remove = (path: string) => setFiles((current) => current.filter((file) => file.path !== path))
-  const queueMerge = async (mode: 'copy' | 'transcode') => { try { if (files.length < 2) throw new Error('请添加至少两个视频文件'); if (mode === 'copy' && !compatible) throw new Error('文件参数不一致，不能无损合并'); await window.avault.startToolMerge(files.map((file) => file.path), outputName, mode, options()); notify('已加入工具箱任务队列') } catch (error) { notify(errorMessage(error), true) } }
-  const queueTranscode = async () => { try { if (!files.length) throw new Error('请先添加视频文件'); await window.avault.startToolTranscode(files.map((file) => file.path), options()); notify('已加入转码任务队列') } catch (error) { notify(errorMessage(error), true) } }
-  const info = selected?.mediaInfo
-  const rows: Array<[string, string]> = info ? [['容器', info.container ?? '未知'], ['视频编码', info.videoCodec?.toUpperCase() ?? '未知'], ['编码器', info.videoEncoder ?? '未知'], ['分辨率', info.width && info.height ? `${info.width} × ${info.height}` : '未知'], ['帧率', info.frameRate ? `${info.frameRate} fps` : '未知'], ['视频码率', info.videoBitrate ? `${Math.round(info.videoBitrate / 1000)} kbps` : '未知'], ['像素格式', info.pixelFormat ?? '未知'], ['HDR', info.hdr ? '是' : '否'], ['音频编码', info.audioCodec?.toUpperCase() ?? '无'], ['音频码率', info.audioBitrate ? `${Math.round(info.audioBitrate / 1000)} kbps` : '未知'], ['音频声道', info.audioChannels ? `${info.audioChannels} 声道` : '未知'], ['时长', info.durationSeconds ? `${Math.floor(info.durationSeconds / 60)} 分 ${Math.round(info.durationSeconds % 60)} 秒` : '未知']] : []
-  return <div className="mx-auto max-w-6xl px-8 py-8"><div className="flex items-start justify-between"><div><h1 className="text-2xl font-bold">工具箱</h1><p className="mt-1 text-sm text-zinc-600">拖入任意本地视频；不关联 AVault 媒体库。</p></div><Badge>FFprobe + FFmpeg</Badge></div><div className="mt-6 flex w-fit rounded-xl border border-white/[0.08] bg-black/20 p-1"><Button size="sm" variant={tab === 'merge' ? 'default' : 'ghost'} onClick={() => setTab('merge')}>合并视频</Button><Button size="sm" variant={tab === 'transcode' ? 'default' : 'ghost'} onClick={() => setTab('transcode')}>转码视频</Button><Button size="sm" variant={tab === 'probe' ? 'default' : 'ghost'} onClick={() => setTab('probe')}>媒体检测</Button></div><div onDragOver={(event) => event.preventDefault()} onDrop={drop} className="mt-5 grid min-h-32 place-items-center rounded-2xl border border-dashed border-violet-400/35 bg-violet-500/[0.04] p-5 text-center"><div><Video className="mx-auto size-6 text-violet-300" /><p className="mt-2 text-sm font-medium">拖入视频文件到这里</p><Button variant="outline" size="sm" className="mt-3" onClick={choose}>选择文件</Button></div></div><div className="mt-6 grid gap-6 lg:grid-cols-[1fr_360px]"><section className="rounded-2xl border border-white/[0.08] bg-white/[0.025] p-4"><div className="flex items-center justify-between"><div><h2 className="font-semibold">{tab === 'probe' ? '已检测文件' : tab === 'merge' ? '合并顺序' : '待转码文件'}</h2><p className="mt-1 text-xs text-zinc-600">点击文件可查看完整媒体参数。</p></div><Badge>{files.length} 个</Badge></div><div className="mt-4 h-[40vh] overflow-y-auto rounded-xl border border-white/[0.07]">{files.map((file, index) => <button key={file.path} type="button" onClick={() => { setSelectedPath(file.path); setTab('probe') }} className={cn('flex w-full items-center gap-3 border-b border-white/[0.055] px-3 py-3 text-left last:border-0', selected?.path === file.path ? 'bg-violet-500/10' : 'hover:bg-white/[0.035]')}><span className="w-5 text-center text-xs text-violet-300">{tab === 'merge' ? index + 1 : ''}</span><Video className="size-4 shrink-0 text-violet-300" /><span className="min-w-0 flex-1"><span className="block truncate text-sm">{file.name}</span><span className="block text-xs text-zinc-600">{formatBytes(file.size)} · {file.mediaInfo?.videoCodec?.toUpperCase() ?? '未检测'} · {file.mediaInfo?.width ?? '?'}×{file.mediaInfo?.height ?? '?'}</span></span><span onClick={(event) => { event.stopPropagation(); remove(file.path) }} className="text-zinc-500 hover:text-rose-300"><X className="size-4" /></span></button>)}{!files.length && <div className="grid h-full place-items-center text-sm text-zinc-600">尚未添加文件</div>}</div></section><aside className="h-fit rounded-2xl border border-white/[0.08] bg-white/[0.025] p-5">{tab === 'probe' ? <><h2 className="font-semibold">媒体参数</h2>{selected ? <><p className="mt-2 truncate text-xs text-zinc-500">{selected.name}</p><div className="mt-4 divide-y divide-white/[0.06] rounded-xl border border-white/[0.07]">{rows.map(([label, value]) => <div key={label} className="flex justify-between gap-4 px-3 py-2 text-xs"><span className="text-zinc-500">{label}</span><span className="text-right text-zinc-200">{value}</span></div>)}</div></> : <p className="mt-4 text-sm text-zinc-600">拖入文件后，FFprobe 会自动分析参数。</p>}</> : <><h2 className="font-semibold">{tab === 'merge' ? '合并设置' : '转码设置'}</h2>{tab === 'merge' && <><label className="mt-4 block text-xs text-zinc-500">输出文件名</label><Input className="mt-1" value={outputName} onChange={(event) => setOutputName(event.target.value)} /><div className={cn('mt-4 rounded-xl border p-3 text-xs', compatible ? 'border-emerald-500/25 bg-emerald-500/[0.06] text-emerald-200' : 'border-amber-500/25 bg-amber-500/[0.06] text-amber-200')}>{compatible ? '参数一致：可无损合并。' : '参数不一致：请使用转码合并。'}</div></>}<label className="mt-4 block text-xs text-zinc-500">视频编码</label><Select value={codec} onValueChange={(value) => setCodec(value as ToolEncodeOptions['codec'])}><SelectTrigger className="mt-1"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="hevc">H.265 / HEVC（体积更小）</SelectItem><SelectItem value="h264">H.264（兼容性更好）</SelectItem></SelectContent></Select><label className="mt-3 block text-xs text-zinc-500">输出分辨率</label><Select value={height} onValueChange={setHeight}><SelectTrigger className="mt-1"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="keep">保持原分辨率</SelectItem><SelectItem value="720">最高 720p</SelectItem><SelectItem value="1080">最高 1080p</SelectItem></SelectContent></Select><label className="mt-3 block text-xs text-zinc-500">视频码率（kbps）</label><Input className="mt-1" value={bitrate} onChange={(event) => setBitrate(event.target.value)} /><p className="mt-1 text-xs text-zinc-600">数值越低，体积越小、画质也越低。</p>{tab === 'merge' ? <div className="mt-5 grid gap-2"><Button disabled={files.length < 2 || !compatible} onClick={() => queueMerge('copy')}>无损合并</Button><Button variant="outline" disabled={files.length < 2 || !snapshot.settings.ffmpeg.nvencAvailable} onClick={() => queueMerge('transcode')}>转码合并</Button></div> : <Button className="mt-5 w-full" disabled={!files.length || !snapshot.settings.ffmpeg.nvencAvailable} onClick={queueTranscode}>加入转码队列</Button>}</>}</aside></div><section className="mt-6 rounded-2xl border border-white/[0.08] bg-white/[0.025] p-4"><h2 className="font-semibold">工具箱任务</h2><div className="mt-3 space-y-2">{tasks.map((task) => <div key={task.id} className="flex items-center gap-3 rounded-lg bg-black/20 px-3 py-2 text-sm"><span className="min-w-0 flex-1 truncate">{task.outputName}</span><span className="text-xs text-zinc-500">{task.state === 'running' ? `${task.percent?.toFixed(1) ?? 0}%` : task.message ?? task.state}</span></div>)}{!tasks.length && <div className="text-sm text-zinc-600">暂无工具箱任务</div>}</div></section></div>
-}
-
-*/
 function SettingsPage({
   snapshot,
   refresh,
   notify,
+  workspace,
+  setWorkspace,
 }: {
   snapshot: AppSnapshot;
   refresh: () => Promise<void>;
   notify: (message: string, error?: boolean) => void;
+  workspace: SettingsWorkspaceState;
+  setWorkspace: React.Dispatch<React.SetStateAction<SettingsWorkspaceState>>;
 }) {
   async function choose() {
     try {
@@ -3144,12 +2953,9 @@ function SettingsPage({
       notify(errorMessage(error), true);
     }
   }
-  const [fc2Cookie, setFc2Cookie] = useState(snapshot.settings.fc2Cookie);
   const [savingFc2Cookie, setSavingFc2Cookie] = useState(false);
-  useEffect(
-    () => setFc2Cookie(snapshot.settings.fc2Cookie),
-    [snapshot.settings.fc2Cookie],
-  );
+  const fc2Cookie = workspace.fc2CookieDraft ?? snapshot.settings.fc2Cookie;
+  const fc2CookieExpanded = workspace.fc2CookieExpanded;
   async function saveFc2Cookie() {
     setSavingFc2Cookie(true);
     try {
@@ -3167,11 +2973,11 @@ function SettingsPage({
     }
   }
   return (
-    <div className="mx-auto max-w-4xl p-8">
+    <div className="mx-auto max-w-6xl px-8 py-7">
       <h1 className="text-2xl font-bold">设置</h1>
       <p className="mt-2 text-sm text-zinc-500">管理播放器和元数据服务。</p>
-      <div className="mt-8 space-y-4">
-        <section className="rounded-2xl border border-white/8 bg-white/[0.025] p-6">
+      <div className="mt-6 grid items-start gap-4 lg:grid-cols-[minmax(0,.85fr)_minmax(0,1.15fr)]">
+        <section className="rounded-2xl border border-white/8 bg-white/[0.025] p-5">
           <div className="flex items-start gap-4">
             <div className="rounded-xl bg-violet-500/10 p-3">
               <Play className="size-5 text-violet-400" />
@@ -3192,7 +2998,7 @@ function SettingsPage({
             </div>
           </div>
         </section>
-        <section className="rounded-2xl border border-white/8 bg-white/[0.025] p-6">
+        <section className="rounded-2xl border border-white/8 bg-white/[0.025] p-5">
           <div className="flex items-start gap-4">
             <div className="rounded-xl bg-emerald-500/10 p-3">
               <Video className="size-5 text-emerald-400" />
@@ -3226,7 +3032,7 @@ function SettingsPage({
             </div>
           </div>
         </section>
-        <section className="rounded-2xl border border-white/8 bg-white/[0.025] p-6">
+        <section className="rounded-2xl border border-white/8 bg-white/[0.025] p-5 lg:col-start-2 lg:row-span-2 lg:row-start-1">
           <div className="flex items-start gap-4">
             <div className="rounded-xl bg-amber-500/10 p-3">
               <Sparkles className="size-5 text-amber-400" />
@@ -3275,40 +3081,49 @@ function SettingsPage({
                       已配置
                     </Badge>
                   )}
-                </div>
-                <Textarea
-                  value={fc2Cookie}
-                  onChange={(event) => setFc2Cookie(event.target.value)}
-                  placeholder="name=value; name2=value2"
-                  className="mt-3 min-h-32 font-mono text-xs"
-                />
-                <div className="mt-3 flex justify-end gap-2">
                   <Button
+                    size="sm"
                     variant="secondary"
-                    onClick={saveFc2Cookie}
-                    disabled={savingFc2Cookie}
+                    onClick={() => setWorkspace((current) => ({ ...current, fc2CookieExpanded: !current.fc2CookieExpanded }))}
                   >
-                    {savingFc2Cookie && (
-                      <LoaderCircle className="size-4 animate-spin" />
-                    )}
-                    保存
+                    {fc2CookieExpanded ? "收起" : "编辑 Cookie"}
                   </Button>
-                  {snapshot.settings.fc2CookieConfigured && (
-                    <Button
-                      variant="ghost"
-                      onClick={() => {
-                        setFc2Cookie("");
-                        void window.avault
-                          .setFc2Cookie("")
-                          .then(refresh)
-                          .then(() => notify("FC2 Cookie 已清除"))
-                          .catch((error) => notify(errorMessage(error), true));
-                      }}
-                    >
-                      清除
-                    </Button>
-                  )}
                 </div>
+                {fc2CookieExpanded && <>
+                  <Textarea
+                    value={fc2Cookie}
+                    onChange={(event) => setWorkspace((current) => ({ ...current, fc2CookieDraft: event.target.value }))}
+                    placeholder="name=value; name2=value2"
+                    className="mt-3 min-h-28 font-mono text-xs"
+                  />
+                  <div className="mt-3 flex justify-end gap-2">
+                    <Button
+                      variant="secondary"
+                      onClick={saveFc2Cookie}
+                      disabled={savingFc2Cookie}
+                    >
+                      {savingFc2Cookie && (
+                        <LoaderCircle className="size-4 animate-spin" />
+                      )}
+                      保存
+                    </Button>
+                    {snapshot.settings.fc2CookieConfigured && (
+                      <Button
+                        variant="ghost"
+                        onClick={() => {
+                          setWorkspace((current) => ({ ...current, fc2CookieDraft: "" }));
+                          void window.avault
+                            .setFc2Cookie("")
+                            .then(refresh)
+                            .then(() => notify("FC2 Cookie 已清除"))
+                            .catch((error) => notify(errorMessage(error), true));
+                        }}
+                      >
+                        清除
+                      </Button>
+                    )}
+                  </div>
+                </>}
               </div>
             </div>
           </div>
@@ -3330,14 +3145,10 @@ export function App() {
   const [gridCoverMode, setGridCoverMode] =
     useState<GridCoverMode>("landscape");
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [actorPage, setActorPage] = useState<{
-    name: string;
-    sourceMovieId: string | null;
-  } | null>(null);
-  const [tagPage, setTagPage] = useState<{
-    name: string;
-    sourceMovieId: string;
-  } | null>(null);
+  const [actorPage, setActorPage] = useState<ActorRoute | null>(null);
+  const [tagPage, setTagPage] = useState<TagRoute | null>(null);
+  const navigationHistoryRef = useRef<NavigationEntry[]>([]);
+  const [canGoBack, setCanGoBack] = useState(false);
   const [scanProgress, setScanProgress] = useState<
     Record<string, ScanProgress>
   >({});
@@ -3353,6 +3164,16 @@ export function App() {
   const [organizeProgress, setOrganizeProgress] =
     useState<OrganizeProgress | null>(null);
   const [transcodeTasks, setTranscodeTasks] = useState<TranscodeProgress[]>([]);
+  const [toolTasks, setToolTasks] = useState<ToolTask[]>([]);
+  const [toolboxSession, setToolboxSession] = useState<ToolboxSession>(emptyToolboxSession);
+  const [settingsWorkspace, setSettingsWorkspace] = useState<SettingsWorkspaceState>({ fc2CookieDraft: null, fc2CookieExpanded: false });
+  const [taskDrawerOpen, setTaskDrawerOpen] = useState(false);
+  const [actorLibrarySearch, setActorLibrarySearch] = useState("");
+  const [refreshing, setRefreshing] = useState(false);
+  const refreshCountRef = useRef(0);
+  const workspaceScrollRef = useRef(new Map<Section, number>());
+  const workspaceStateRef = useRef(new Map<Section, LibraryWorkspaceState>());
+  const preferencesInitializedRef = useRef(false);
   const [moreMenuOpen, setMoreMenuOpen] = useState(false);
   const [toast, setToast] = useState<{
     message: string;
@@ -3360,14 +3181,21 @@ export function App() {
   } | null>(null);
   const mainRef = useRef<HTMLElement>(null);
   const libraryScrollRef = useRef(0);
+  const actorLibraryScrollRef = useRef(0);
   const actorScrollRef = useRef(0);
   const tagScrollRef = useRef(0);
   const moreMenuRef = useRef<HTMLDivElement>(null);
 
-  const refresh = useCallback(
-    async () => setSnapshot(await window.avault.getSnapshot()),
-    [],
-  );
+  const refresh = useCallback(async () => {
+    refreshCountRef.current += 1;
+    setRefreshing(true);
+    try {
+      setSnapshot(await window.avault.getSnapshot());
+    } finally {
+      refreshCountRef.current = Math.max(0, refreshCountRef.current - 1);
+      if (refreshCountRef.current === 0) setRefreshing(false);
+    }
+  }, []);
   const notify = useCallback((message: string, error = false) => {
     setToast({ message, error });
     window.setTimeout(() => setToast(null), 3500);
@@ -3375,6 +3203,8 @@ export function App() {
 
   useEffect(() => {
     if (!snapshot) return;
+    if (preferencesInitializedRef.current) return;
+    preferencesInitializedRef.current = true;
     const preferences = snapshot.settings.homePreferences;
     setSort(preferences.sort);
     setWatchFilter(preferences.watchFilter);
@@ -3432,6 +3262,7 @@ export function App() {
       .getTranscodeTasks()
       .then(setTranscodeTasks)
       .catch(() => undefined);
+    void window.avault.getToolTasks().then(setToolTasks).catch(() => undefined);
     const unsubscribeTranscode = window.avault.onTranscodeProgress(
       (progress) => {
         setTranscodeTasks((current) => {
@@ -3447,11 +3278,18 @@ export function App() {
         if (progress.state === "completed") void refresh();
       },
     );
+    const unsubscribeTool = window.avault.onToolTaskProgress((task) => {
+      setToolTasks((current) => {
+        const index = current.findIndex((item) => item.id === task.id);
+        return index < 0 ? [...current, task] : current.map((item) => item.id === task.id ? task : item);
+      });
+    });
     return () => {
       unsubscribeScan();
       unsubscribeMetadataBatch();
       unsubscribeOrganize();
       unsubscribeTranscode();
+      unsubscribeTool();
     };
   }, [refresh, notify]);
 
@@ -3541,6 +3379,36 @@ export function App() {
   const activeMetadataBatch = Object.values(metadataBatchProgress).find(
     (progress) => ["starting", "processing"].includes(progress.phase),
   );
+  const unifiedTasks = useMemo<UnifiedTask[]>(() => {
+    const files = new Map((snapshot?.movies ?? []).flatMap((movie) => movie.files).map((file) => [file.id, file]));
+    const media = transcodeTasks.map((task) => {
+      const file = files.get(task.fileId);
+      return {
+        id: `media:${task.fileId}:${task.kind}`, source: "媒体库" as const,
+        name: file?.name ?? "源文件已移除",
+        detail: task.kind === "hevc" ? "高清 HEVC 原分辨率" : "720p HEVC",
+        state: task.state, percent: task.percent, speed: task.speed, etaSeconds: task.etaSeconds,
+        outputPath: task.outputPath, message: task.message, createdAt: task.createdAt, queueOrder: task.queueOrder,
+        cancel: async () => { await window.avault.cancelTranscode(task.fileId, task.kind); },
+        remove: async () => {
+          await window.avault.removeTranscodeTask(task.fileId, task.kind);
+          setTranscodeTasks((current) => current.filter((item) => item.fileId !== task.fileId || item.kind !== task.kind));
+        },
+      };
+    });
+    const tools = toolTasks.map((task) => ({
+      id: `tool:${task.id}`, source: "工具箱" as const, name: task.outputName,
+      detail: task.type === "merge-copy" ? "无损合并" : task.type === "merge-transcode" ? "转码合并" : "独立转码",
+      state: task.state, percent: task.percent, speed: task.speed, etaSeconds: task.etaSeconds,
+      outputPath: task.outputPath, message: task.message, createdAt: task.createdAt, queueOrder: task.queueOrder,
+      cancel: () => window.avault.cancelToolTask(task.id), remove: async () => {
+        await window.avault.removeToolTask(task.id);
+        setToolTasks((current) => current.filter((item) => item.id !== task.id));
+      },
+    }));
+    return [...media, ...tools];
+  }, [snapshot?.movies, toolTasks, transcodeTasks]);
+  const activeTaskCount = unifiedTasks.filter((task) => task.state === "queued" || task.state === "running").length;
   const title =
     section === "all"
       ? "全部影片"
@@ -3549,6 +3417,25 @@ export function App() {
         : section === "unidentified"
           ? "未识别影片"
           : (activeLibrary?.name ?? "AVault");
+  const navigationHeader = (() => {
+    switch (section) {
+      case "tools": return { title: "工具箱", subtitle: "独立本地媒体处理" };
+      case "tasks": return { title: "转码任务", subtitle: "任务队列与进度" };
+      case "ai": return { title: "AI 中心", subtitle: "演员资料与用量管理" };
+      case "logs": return { title: "运行日志", subtitle: "资料与 FFmpeg 运行记录" };
+      case "devices": return { title: "连接手机", subtitle: "局域网配对与设备管理" };
+      case "settings": return { title: "设置", subtitle: "播放器与元数据服务" };
+      case "actors": return { title: "演员库", subtitle: "浏览本地演员资料" };
+      case "uncrawled": return { title: "未获取资料", subtitle: "等待补充影片资料" };
+      case "unidentified": return { title: "未识别影片", subtitle: "需要确认番号的本地文件" };
+      case "all": return { title: "全部影片", subtitle: "本地媒体库" };
+      default: return { title: activeLibrary?.name ?? "媒体文件夹", subtitle: activeLibrary?.path ?? "本地媒体库" };
+    }
+  })();
+  const showToolBack = section === "tools" && canGoBack;
+  const showUtilityBack =
+    canGoBack &&
+    (["settings", "tasks", "ai", "logs", "devices"] as Section[]).includes(section);
 
   function scrollMainTo(top: number) {
     window.requestAnimationFrame(() =>
@@ -3556,16 +3443,73 @@ export function App() {
     );
   }
 
+  function saveWorkspaceState() {
+    if (selectedId || actorPage || tagPage) return;
+    workspaceScrollRef.current.set(section, mainRef.current?.scrollTop ?? 0);
+    workspaceStateRef.current.set(section, {
+      scrollTop: mainRef.current?.scrollTop ?? 0,
+      search, sort, watchFilter, sourcePartitionFilter, libraryUnidentifiedOnly, view, gridCoverMode, actorSearch: actorLibrarySearch,
+    });
+  }
+
+  function restoreWorkspaceState(next: Section) {
+    const saved = workspaceStateRef.current.get(next);
+    const fallback = snapshot!.settings.homePreferences;
+    const state = saved ?? {
+      scrollTop: workspaceScrollRef.current.get(next) ?? 0,
+      search: "", sort: fallback.sort, watchFilter: fallback.watchFilter,
+      sourcePartitionFilter: "all" as const, libraryUnidentifiedOnly: false,
+      view: fallback.view, gridCoverMode: fallback.gridCoverMode, actorSearch: "",
+    };
+    setSearch(state.search);
+    setSort(state.sort);
+    setWatchFilter(state.watchFilter);
+    setSourcePartitionFilter(state.sourcePartitionFilter);
+    setLibraryUnidentifiedOnly(state.libraryUnidentifiedOnly);
+    setView(state.view);
+    setGridCoverMode(state.gridCoverMode);
+    setActorLibrarySearch(state.actorSearch);
+    scrollMainTo(state.scrollTop);
+  }
+
   function navigate(next: Section) {
+    const isAlreadyHere = section === next && !selectedId && !actorPage && !tagPage;
+    if (isAlreadyHere) return;
+    saveWorkspaceState();
+    const utilitySections: Section[] = ["tools", "tasks", "ai", "logs", "devices", "settings"];
+    if (utilitySections.includes(next)) {
+      navigationHistoryRef.current = [
+        ...navigationHistoryRef.current.slice(-29),
+        { section, selectedId, actorPage, tagPage, libraryUnidentifiedOnly, scrollTop: mainRef.current?.scrollTop ?? 0 },
+      ];
+      setCanGoBack(true);
+    } else {
+      navigationHistoryRef.current = [];
+      setCanGoBack(false);
+    }
     setSelectedId(null);
     setActorPage(null);
     setTagPage(null);
-    setLibraryUnidentifiedOnly(false);
     setSection(next);
-    scrollMainTo(0);
+    restoreWorkspaceState(next);
+  }
+
+  function goBack() {
+    const previous = navigationHistoryRef.current.pop();
+    setCanGoBack(navigationHistoryRef.current.length > 0);
+    if (!previous) return;
+    setSection(previous.section);
+    setSelectedId(previous.selectedId);
+    setActorPage(previous.actorPage);
+    setTagPage(previous.tagPage);
+    setLibraryUnidentifiedOnly(previous.libraryUnidentifiedOnly);
+    if (!previous.selectedId && !previous.actorPage && !previous.tagPage)
+      restoreWorkspaceState(previous.section);
+    else scrollMainTo(previous.scrollTop);
   }
 
   function openMovie(id: string) {
+    saveWorkspaceState();
     libraryScrollRef.current = mainRef.current?.scrollTop ?? 0;
     setActorPage(null);
     setTagPage(null);
@@ -3600,11 +3544,16 @@ export function App() {
     const sourceMovieId = actorPage?.sourceMovieId;
     setActorPage(null);
     if (sourceMovieId) setSelectedId(sourceMovieId);
-    else setSection("actors");
-    scrollMainTo(0);
+    else {
+      setSection("actors");
+      restoreWorkspaceState("actors");
+    }
+    if (sourceMovieId) scrollMainTo(0);
   }
 
   function openActorLibraryEntry(actor: string) {
+    saveWorkspaceState();
+    actorLibraryScrollRef.current = mainRef.current?.scrollTop ?? 0;
     setSelectedId(null);
     setTagPage(null);
     setActorPage({ name: actor, sourceMovieId: null });
@@ -3958,26 +3907,19 @@ export function App() {
               工具箱
             </button>
             <button
-              onClick={() => navigate("tasks")}
+              onClick={() => setTaskDrawerOpen(true)}
               className={cn(
                 "flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm",
-                section === "tasks" && !selectedMovie
+                taskDrawerOpen || (section === "tasks" && !selectedMovie)
                   ? "bg-white/7 text-white"
                   : "text-zinc-500 hover:bg-white/4 hover:text-zinc-300",
               )}
             >
               <Archive className="size-4" />
               任务
-              {transcodeTasks.filter(
-                (task) => task.state === "queued" || task.state === "running",
-              ).length > 0 && (
+              {activeTaskCount > 0 && (
                 <Badge className="ml-auto border-0 bg-violet-500/15 px-1.5 py-0 text-[10px] text-violet-300">
-                  {
-                    transcodeTasks.filter(
-                      (task) =>
-                        task.state === "queued" || task.state === "running",
-                    ).length
-                  }
+                  {activeTaskCount}
                 </Badge>
               )}
             </button>
@@ -4045,6 +3987,9 @@ export function App() {
             section === "tools" && !selectedMovie ? "overflow-hidden" : "overflow-y-auto",
           )}
         >
+          {showUtilityBack && (
+            <BackNavigationHeader onBack={goBack} {...navigationHeader} />
+          )}
           {selectedMovie ? (
             <MovieDetailPage
               movie={selectedMovie}
@@ -4089,16 +4034,13 @@ export function App() {
               onPlay={playMovieFromCard}
             />
           ) : section === "actors" ? (
-            <ActorLibraryPage actors={actors} onOpen={openActorLibraryEntry} />
+            <ActorLibraryPage actors={actors} onOpen={openActorLibraryEntry} search={actorLibrarySearch} onSearchChange={setActorLibrarySearch} />
           ) : section === "tasks" ? (
-            <TasksPage
-              snapshot={snapshot}
-              tasks={transcodeTasks}
-              onChanged={async () =>
-                setTranscodeTasks(await window.avault.getTranscodeTasks())
-              }
-              notify={notify}
-            />
+            <div className="mx-auto max-w-5xl p-8">
+              <h1 className="text-2xl font-bold">全部任务</h1>
+              <p className="mt-2 text-sm text-zinc-500">媒体库与工具箱任务按同一 FFmpeg 队列执行。</p>
+              <div className="mt-6"><UnifiedTaskList tasks={unifiedTasks} notify={notify} /></div>
+            </div>
           ) : section === "ai" ? (
             <AiCenterPage
               snapshot={snapshot}
@@ -4108,7 +4050,16 @@ export function App() {
           ) : section === "logs" ? (
             <LogsPage notify={notify} />
           ) : section === "tools" ? (
-            <IndependentToolsPage snapshot={snapshot} notify={notify} />
+            showToolBack ? (
+              <div className="flex h-full min-h-0 flex-col">
+                <BackNavigationHeader onBack={goBack} {...navigationHeader} />
+                <div className="min-h-0 flex-1">
+                  <IndependentToolsPage snapshot={snapshot} notify={notify} session={toolboxSession} setSession={setToolboxSession} />
+                </div>
+              </div>
+            ) : (
+              <IndependentToolsPage snapshot={snapshot} notify={notify} session={toolboxSession} setSession={setToolboxSession} />
+            )
           ) : section === "devices" ? (
             <DevicesPage
               snapshot={snapshot}
@@ -4120,6 +4071,8 @@ export function App() {
               snapshot={snapshot}
               refresh={refresh}
               notify={notify}
+              workspace={settingsWorkspace}
+              setWorkspace={setSettingsWorkspace}
             />
           ) : (
             <>
@@ -4306,11 +4259,19 @@ export function App() {
                     <Button
                       variant="outline"
                       size="sm"
+                      className="h-9 rounded-lg px-3.5 text-sm"
                       onClick={() => void refresh()}
+                      disabled={refreshing}
                       title="重新读取媒体库资料，不扫描文件"
+                      aria-busy={refreshing}
                     >
-                      <RefreshCw className="size-4" />
-                      刷新
+                      <RefreshCw
+                        className={cn(
+                          "size-4 transition-transform",
+                          refreshing && "animate-spin",
+                        )}
+                      />
+                      {refreshing ? "刷新中" : "刷新"}
                     </Button>
                     {activeLibrary && <>
                       <div className="flex items-center gap-2 rounded-lg border border-white/[0.07] bg-white/[0.025] pl-3">
@@ -4631,6 +4592,17 @@ export function App() {
             )}
           </DialogContent>
         </Dialog>
+
+        <TaskDrawer
+          open={taskDrawerOpen}
+          onClose={() => setTaskDrawerOpen(false)}
+          onOpenTasks={() => {
+            setTaskDrawerOpen(false);
+            navigate("tasks");
+          }}
+          tasks={unifiedTasks}
+          notify={notify}
+        />
 
         {toast && (
           <div

@@ -63,6 +63,8 @@ export interface TranscodeProgress {
   percent: number | null
   speed: string | null
   etaSeconds: number | null
+  createdAt?: string
+  queueOrder?: number
   outputPath?: string
   message?: string
 }
@@ -91,6 +93,8 @@ export interface ToolTask {
   percent: number | null
   speed: string | null
   etaSeconds: number | null
+  createdAt?: string
+  queueOrder?: number
   outputPath?: string
   message?: string
 }
@@ -369,7 +373,7 @@ export interface DesktopApi {
   getLogs: (scope?: AppLogEntry['scope']) => Promise<AppLogEntry[]>
   clearLogs: (scope?: AppLogEntry['scope']) => Promise<void>
   startTranscode: (fileId: string, kind: TranscodeKind) => Promise<void>
-  cancelTranscode: () => Promise<void>
+  cancelTranscode: (fileId: string, kind: TranscodeKind) => Promise<void>
   getTranscodeTasks: () => Promise<TranscodeProgress[]>
   removeTranscodeTask: (fileId: string, kind: TranscodeKind) => Promise<void>
   replaceOriginalWithHevc: (originalFileId: string, hevcFileId: string) => Promise<void>

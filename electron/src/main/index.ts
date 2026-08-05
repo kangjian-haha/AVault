@@ -30,6 +30,7 @@ import { LanServer } from './lan-server'
 import { FfmpegService } from './ffmpeg'
 import { MediaOrganizer, createOrganizePreview } from './organizer'
 import { sidecarPathForMediaFile, writeMovieSidecar } from './sidecar'
+import { pickNextFfmpegSource } from './ffmpeg-task-queue'
 import type { ActorProfilePatch, HomePreferences, MetadataBatchProgress, MetadataDetails, MoviePatch, MovieRecord, ScanProgress, SourcePartition, ToolEncodeOptions, ToolFile, ToolTask, TranscodeKind, TranscodeProgress } from '../shared/contracts'
 
 protocol.registerSchemesAsPrivileged([
@@ -60,11 +61,12 @@ let metadataBatchRunning = false
 const metadataLookupSessions = new Map<string, { provider: JavBusProvider | Fc2Provider; expiresAt: number }>()
 let syncedFc2Cookie = ''
 const transcodeTasks: TranscodeProgress[] = []
-let processingTranscodeQueue = false
+let processingFfmpegQueue = false
 let organizer: MediaOrganizer | null = null
 const toolTasks: ToolTask[] = []
-let processingToolQueue = false
 let ffmpegWork = Promise.resolve()
+let activeQueuedTask: { source: 'media' | 'tool'; id: string } | null = null
+let ffmpegTaskSequence = 0
 const TOOL_VIDEO_EXTENSIONS = new Set(['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.m4v', '.ts'])
 
 function enqueueFfmpeg<T>(operation: () => Promise<T>): Promise<T> {
@@ -349,35 +351,6 @@ function publishTranscode(task: TranscodeProgress): void {
   mainWindow?.webContents.send('transcode:progress', { ...task })
 }
 
-async function processTranscodeQueue(): Promise<void> {
-  if (processingTranscodeQueue) return
-  processingTranscodeQueue = true
-  try {
-    while (true) {
-      const task = transcodeTasks.find((candidate) => candidate.state === 'queued')
-      if (!task) return
-      const file = database.getFile(task.fileId)
-      if (!file?.available) {
-        task.state = 'failed'; task.message = '源文件已失效'; publishTranscode(task); continue
-      }
-      task.state = 'running'; task.percent = 0; task.message = undefined; publishTranscode(task)
-      try {
-        const result = await enqueueFfmpeg(() => ffmpeg.transcode(file.path, file.id, task.kind, (progress) => {
-          Object.assign(task, progress); publishTranscode(task)
-        }, (command) => database.addLog('ffmpeg', 'info', `开始转码：${file.name}`, command)))
-        await scanner.scan(file.libraryId)
-        Object.assign(task, { state: 'completed', percent: 100, speed: null, etaSeconds: 0, outputPath: result.outputPath, message: '转码完成' })
-        database.addLog('ffmpeg', 'info', `转码完成：${file.name}`, `输出文件：${result.outputPath}`)
-      } catch (error) {
-        const cancelled = error instanceof Error && error.message.includes('已取消')
-        Object.assign(task, { state: cancelled ? 'cancelled' : 'failed', percent: null, speed: null, etaSeconds: null, message: error instanceof Error ? error.message : '转码失败' })
-        database.addLog('ffmpeg', cancelled ? 'info' : 'error', `${cancelled ? '转码已取消' : '转码失败'}：${file.name}`, error instanceof Error ? error.stack ?? error.message : String(error))
-      }
-      publishTranscode(task)
-    }
-  } finally { processingTranscodeQueue = false }
-}
-
 function publishToolTask(task: ToolTask): void { mainWindow?.webContents.send('tool:task-progress', { ...task }) }
 
 async function inspectToolFiles(paths: string[]): Promise<ToolFile[]> {
@@ -400,28 +373,66 @@ function validToolOptions(options: ToolEncodeOptions): ToolEncodeOptions {
   return options
 }
 
-async function processToolQueue(): Promise<void> {
-  if (processingToolQueue) return
-  processingToolQueue = true
+async function runMediaTask(task: TranscodeProgress): Promise<void> {
+  const file = database.getFile(task.fileId)
+  if (!file?.available) {
+    Object.assign(task, { state: 'failed', message: '源文件已失效' }); publishTranscode(task); return
+  }
   try {
-    while (true) {
-      const task = toolTasks.find((item) => item.state === 'queued')
-      if (!task) return
-      task.state = 'running'; task.percent = 0; task.message = task.type === 'merge-copy' ? '正在无损合并' : task.type === 'merge-transcode' ? '正在转码合并' : '正在转码'; publishToolTask(task)
+    const result = await enqueueFfmpeg(async () => {
+      if (!transcodeTasks.includes(task) || task.state !== 'queued') throw new Error('转码已取消')
+      activeQueuedTask = { source: 'media', id: `${task.fileId}:${task.kind}` }
+      Object.assign(task, { state: 'running', percent: 0, message: undefined }); publishTranscode(task)
       try {
-        const result = await enqueueFfmpeg(() => task.type === 'transcode'
+        return await ffmpeg.transcode(file.path, file.id, task.kind, (progress) => { Object.assign(task, progress); publishTranscode(task) }, (command) => database.addLog('ffmpeg', 'info', `开始转码：${file.name}`, command))
+      } finally { activeQueuedTask = null }
+    })
+    await scanner.scan(file.libraryId)
+    Object.assign(task, { state: 'completed', percent: 100, speed: null, etaSeconds: 0, outputPath: result.outputPath, message: '转码完成' })
+    database.addLog('ffmpeg', 'info', `转码完成：${file.name}`, `输出文件：${result.outputPath}`)
+  } catch (error) {
+    const cancelled = error instanceof Error && error.message.includes('已取消')
+    Object.assign(task, { state: cancelled ? 'cancelled' : 'failed', percent: null, speed: null, etaSeconds: null, message: error instanceof Error ? error.message : '转码失败' })
+    database.addLog('ffmpeg', cancelled ? 'info' : 'error', `${cancelled ? '转码已取消' : '转码失败'}：${file.name}`, error instanceof Error ? error.stack ?? error.message : String(error))
+  }
+  publishTranscode(task)
+}
+
+async function runToolTask(task: ToolTask): Promise<void> {
+  try {
+    const result = await enqueueFfmpeg(async () => {
+      if (!toolTasks.includes(task) || task.state !== 'queued') throw new Error('任务已取消')
+      activeQueuedTask = { source: 'tool', id: task.id }
+      Object.assign(task, { state: 'running', percent: 0, message: task.type === 'merge-copy' ? '正在无损合并' : task.type === 'merge-transcode' ? '正在转码合并' : '正在转码' }); publishToolTask(task)
+      try {
+        return await (task.type === 'transcode'
           ? ffmpeg.toolTranscode(task.inputPaths[0], task.options!, (progress) => { Object.assign(task, progress); publishToolTask(task) }, (command) => database.addLog('ffmpeg', 'info', `工具箱转码：${task.outputName}`, command))
           : ffmpeg.merge(task.inputPaths, task.outputName, task.type === 'merge-copy' ? 'copy' : 'transcode', task.options!, (progress) => { Object.assign(task, progress); publishToolTask(task) }, (command) => database.addLog('ffmpeg', 'info', `工具箱合并：${task.outputName}`, command)))
-        Object.assign(task, { state: 'completed', percent: 100, speed: null, etaSeconds: 0, outputPath: result.outputPath, message: '完成' })
-        database.addLog('ffmpeg', 'info', `工具箱任务完成：${task.outputName}`, `输出文件：${result.outputPath}`)
-      } catch (error) {
-        const cancelled = error instanceof Error && error.message.includes('取消')
-        Object.assign(task, { state: cancelled ? 'cancelled' : 'failed', percent: null, speed: null, etaSeconds: null, message: error instanceof Error ? error.message : '任务失败' })
-        database.addLog('ffmpeg', cancelled ? 'info' : 'error', `工具箱任务${cancelled ? '已取消' : '失败'}：${task.outputName}`, error instanceof Error ? error.stack ?? error.message : String(error))
-      }
-      publishToolTask(task)
+      } finally { activeQueuedTask = null }
+    })
+    Object.assign(task, { state: 'completed', percent: 100, speed: null, etaSeconds: 0, outputPath: result.outputPath, message: '完成' })
+    database.addLog('ffmpeg', 'info', `工具箱任务完成：${task.outputName}`, `输出文件：${result.outputPath}`)
+  } catch (error) {
+    const cancelled = error instanceof Error && error.message.includes('取消')
+    Object.assign(task, { state: cancelled ? 'cancelled' : 'failed', percent: null, speed: null, etaSeconds: null, message: error instanceof Error ? error.message : '任务失败' })
+    database.addLog('ffmpeg', cancelled ? 'info' : 'error', `工具箱任务${cancelled ? '已取消' : '失败'}：${task.outputName}`, error instanceof Error ? error.stack ?? error.message : String(error))
+  }
+  publishToolTask(task)
+}
+
+async function processFfmpegQueue(): Promise<void> {
+  if (processingFfmpegQueue) return
+  processingFfmpegQueue = true
+  try {
+    while (true) {
+      const mediaTask = transcodeTasks.find((task) => task.state === 'queued')
+      const toolTask = toolTasks.find((task) => task.state === 'queued')
+      const source = pickNextFfmpegSource(transcodeTasks, toolTasks)
+      if (!source) return
+      if (source === 'media' && mediaTask) await runMediaTask(mediaTask)
+      else if (source === 'tool' && toolTask) await runToolTask(toolTask)
     }
-  } finally { processingToolQueue = false }
+  } finally { processingFfmpegQueue = false }
 }
 
 function registerIpc(): void {
@@ -812,7 +823,7 @@ function registerIpc(): void {
     const existing = database.getActorProfile(name)
     const provider = new DeepSeekActorProvider(database.getSetting('deepSeekApiKey') ?? '', (url, init) => net.fetch(url instanceof URL ? url.toString() : url, init))
     try {
-      const sources = await searchActorPublicSources(name)
+      const sources = await searchActorPublicSources(name, (url, init) => net.fetch(url, init))
       const result = await provider.getActorDetails(name, existing?.aliases ?? [], sources)
       database.recordAiUsage('deepseek-v4-flash', result.usage.promptTokens, result.usage.completionTokens, result.usage.totalTokens, true)
       database.addLog('ai', 'info', `AI 演员资料返回：${name}`, `联网来源：\n${sources.map((source) => `${source.title}\n${source.url}`).join('\n\n')}\n\n请求：\n${result.request}\n\n原始返回：\n${result.response}`)
@@ -868,12 +879,18 @@ function registerIpc(): void {
     const file = database.getFile(fileId)
     if (!file?.available) throw new Error('影片文件不可用')
     if (transcodeTasks.some((task) => task.fileId === fileId && task.kind === kind && ['queued', 'running'].includes(task.state))) throw new Error('该转码任务已在队列中')
-    const task: TranscodeProgress = { fileId, kind, state: 'queued', percent: 0, speed: null, etaSeconds: null }
+    const task: TranscodeProgress = { fileId, kind, state: 'queued', percent: 0, speed: null, etaSeconds: null, createdAt: new Date().toISOString(), queueOrder: ++ffmpegTaskSequence }
     transcodeTasks.push(task)
     publishTranscode(task)
-    void processTranscodeQueue()
+    void processFfmpegQueue()
   })
-  ipcMain.handle('transcode:cancel', () => ffmpeg.cancel())
+  ipcMain.handle('transcode:cancel', (_event, fileId: string, kind: TranscodeKind) => {
+    const task = transcodeTasks.find((item) => item.fileId === fileId && item.kind === kind)
+    if (!task) throw new Error('任务不存在')
+    if (task.state === 'queued') { task.state = 'cancelled'; task.message = '已取消'; publishTranscode(task); return }
+    if (task.state !== 'running' || activeQueuedTask?.source !== 'media' || activeQueuedTask.id !== `${fileId}:${kind}`) throw new Error('该任务当前未在执行')
+    ffmpeg.cancel()
+  })
   ipcMain.handle('transcode:list', () => transcodeTasks.map((task) => ({ ...task })))
   ipcMain.handle('transcode:remove', (_event, fileId: string, kind: TranscodeKind) => {
     const index = transcodeTasks.findIndex((task) => task.fileId === fileId && task.kind === kind && task.state !== 'running')
@@ -900,8 +917,8 @@ function registerIpc(): void {
   ipcMain.handle('tool:start-merge', async (_event, paths: string[], outputName: string, mode: 'copy' | 'transcode', options: ToolEncodeOptions) => {
     const files = await inspectToolFiles(Array.isArray(paths) ? paths : [])
     if (files.length < 2 || !['copy', 'transcode'].includes(mode) || !outputName.trim()) throw new Error('合并参数无效')
-    const task: ToolTask = { id: randomUUID(), type: mode === 'copy' ? 'merge-copy' : 'merge-transcode', inputPaths: files.map((file) => file.path), outputName: outputName.trim(), options: validToolOptions(options), state: 'queued', percent: 0, speed: null, etaSeconds: null }
-    toolTasks.push(task); publishToolTask(task); void processToolQueue()
+    const task: ToolTask = { id: randomUUID(), type: mode === 'copy' ? 'merge-copy' : 'merge-transcode', inputPaths: files.map((file) => file.path), outputName: outputName.trim(), options: validToolOptions(options), state: 'queued', percent: 0, speed: null, etaSeconds: null, createdAt: new Date().toISOString(), queueOrder: ++ffmpegTaskSequence }
+    toolTasks.push(task); publishToolTask(task); void processFfmpegQueue()
   })
   ipcMain.handle('tool:start-transcode', async (_event, paths: string[], options: ToolEncodeOptions) => {
     const files = await inspectToolFiles(Array.isArray(paths) ? paths : [])
@@ -909,16 +926,19 @@ function registerIpc(): void {
     const validOptions = validToolOptions(options)
     for (const file of files) {
       const suffix = `${validOptions.codec === 'hevc' ? 'H265' : 'H264'}${validOptions.height ? ` ${validOptions.height}p` : ' 原分辨率'} CQ${validOptions.cq}`
-      const task: ToolTask = { id: randomUUID(), type: 'transcode', inputPaths: [file.path], outputName: `${basename(file.path, extname(file.path))} [工具 ${suffix}]`, options: validOptions, state: 'queued', percent: 0, speed: null, etaSeconds: null }
+      const task: ToolTask = { id: randomUUID(), type: 'transcode', inputPaths: [file.path], outputName: `${basename(file.path, extname(file.path))} [工具 ${suffix}]`, options: validOptions, state: 'queued', percent: 0, speed: null, etaSeconds: null, createdAt: new Date().toISOString(), queueOrder: ++ffmpegTaskSequence }
       toolTasks.push(task); publishToolTask(task)
     }
-    void processToolQueue()
+    void processFfmpegQueue()
   })
   ipcMain.handle('tool:list-tasks', () => toolTasks.map((task) => ({ ...task })))
   ipcMain.handle('tool:cancel-task', (_event, id: string) => {
     const task = toolTasks.find((item) => item.id === id)
     if (!task) throw new Error('任务不存在')
-    if (task.state === 'running') ffmpeg.cancel()
+    if (task.state === 'running') {
+      if (activeQueuedTask?.source !== 'tool' || activeQueuedTask.id !== id) throw new Error('该任务当前未在执行')
+      ffmpeg.cancel()
+    }
     else if (task.state === 'queued') { task.state = 'cancelled'; task.message = '已取消'; publishToolTask(task) }
   })
   ipcMain.handle('tool:remove-task', (_event, id: string) => {
@@ -927,8 +947,9 @@ function registerIpc(): void {
     toolTasks.splice(index, 1)
   })
   ipcMain.handle('tool:reveal-output', (_event, path: string) => {
-    const task = toolTasks.find((item) => item.outputPath === path && item.state === 'completed')
-    if (!task || !existsSync(path)) throw new Error('转码输出文件不存在')
+    const toolTask = toolTasks.find((item) => item.outputPath === path && item.state === 'completed')
+    const mediaTask = transcodeTasks.find((item) => item.outputPath === path && item.state === 'completed')
+    if ((!toolTask && !mediaTask) || !existsSync(path)) throw new Error('转码输出文件不存在')
     shell.showItemInFolder(path)
   })
 
