@@ -16,10 +16,11 @@ describe('uncensored filename recognition', () => {
     }
   })
 
-  it('keeps leaked and unknown separate and treats -C as subtitles', () => {
+  it('keeps leaked and unknown separate and uses -C only for code recognition', () => {
     expect(inferSourcePartition('SSIS-826', 'SSIS-826-LEAK')).toBe('leaked')
     expect(inferSourcePartition(null, 'random-video')).toBe('unknown')
     expect(inferSourcePartition('SSIS-826')).toBe('censored')
-    expect(parseVideoFilename('031515-828-C.mp4').versionLabel).toContain('字幕')
+    expect(parseVideoFilename('031515-828-C.mp4')).toMatchObject({ normalizedCode: '031515-828', versionLabel: null })
+    expect(parseVideoFilename('MSFH-018-HEVC-C.mov')).toMatchObject({ normalizedCode: 'MSFH-018', versionLabel: 'HEVC 原分辨率' })
   })
 })

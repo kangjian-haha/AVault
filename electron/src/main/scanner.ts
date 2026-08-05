@@ -58,11 +58,10 @@ export function parseVideoFilename(fileName: string, parentName = ''): ParsedFil
   const partMatch = withoutExtension.match(/(?:^|[-_.\s])(?:CD|PART|PT)[-_.\s]?(\d{1,2})(?=$|[-_.\s])/i)
   const resolution = withoutExtension.match(/(?:2160P|1080P|720P|4K|UHD)/i)?.[0]?.toUpperCase()
   const hevc = /(?:\[\s*)?(?:HEVC|H\.265|H265|X265)(?:\s*\])?/i.test(withoutExtension)
-  const subtitles = /(?:中字|中文字幕|SUB|SUBBED|(?:^|[-_.\s])-?C$)/i.test(withoutExtension) ? '字幕' : null
   return {
     normalizedCode,
     partLabel: partMatch ? `第 ${Number(partMatch[1])} 部分` : null,
-    versionLabel: [hevc ? (resolution === '720P' ? '720p HEVC' : 'HEVC 原分辨率') : resolution, subtitles].filter(Boolean).join(' · ') || null
+    versionLabel: hevc ? (resolution === '720P' ? '720p HEVC' : 'HEVC 原分辨率') : resolution ?? null
   }
 }
 

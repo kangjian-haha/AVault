@@ -232,6 +232,14 @@ export class AppDatabase {
     for (const [column, definition] of actorColumnMigrations) {
       if (!actorColumns.has(column)) this.sqlite.exec(`ALTER TABLE actor_profiles ADD COLUMN ${column} ${definition}`)
     }
+    // `-C` is only a filename hint for code recognition. Earlier builds also
+    // persisted it as a visible "字幕" version label; remove that derived label
+    // while preserving actual encoding/resolution version labels.
+    this.sqlite.prepare(`
+      UPDATE media_files
+      SET version_label = NULLIF(TRIM(REPLACE(REPLACE(version_label, ' · 字幕', ''), '字幕', '')), '')
+      WHERE version_label LIKE '%字幕%'
+    `).run()
     this.sqlite.prepare("DELETE FROM settings WHERE key IN ('dmmApiId', 'dmmAffiliateId')").run()
   }
 
