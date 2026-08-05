@@ -100,6 +100,19 @@ private fun watchStatusLabel(status: String) = when (status) { "watching" -> "�
     val context = LocalContext.current; val store = remember { PairingStore(context) }; val scope = rememberCoroutineScope()
     var pairing by remember { mutableStateOf(store.get()) }; var screen by remember { mutableStateOf("library") }; var searching by remember { mutableStateOf(false) }; var selected by remember { mutableStateOf<RemoteMovie?>(null) }; var playing by remember { mutableStateOf(false) }; var playFileId by remember { mutableStateOf<String?>(null) }; var related by remember { mutableStateOf<Pair<String, String>?>(null) }; var error by remember { mutableStateOf<String?>(null) }
     fun connect() = scope.launch { val current = pairing ?: return@launch; try { withContext(Dispatchers.IO) { check(AvaultApi(current).health() == current.serverId) }; error = null } catch (e: UnauthorizedException) { store.clear(); pairing = null } catch (_: Exception) { val found = withContext(Dispatchers.IO) { withTimeoutOrNull(6_000) { discoverServer(context, current.serverId) } }; if (found != null) { val updated = found.copy(token = current.token); try { withContext(Dispatchers.IO) { check(AvaultApi(updated).health() == updated.serverId) }; store.save(updated); pairing = updated; error = null } catch (e: Exception) { error = e.message ?: "电脑离线" } } else error = "无法连接电脑，请确认位于同一局域网" } }
+    fun openMovie(summary: RemoteMovie) = scope.launch {
+        val current = pairing ?: return@launch
+        selected = try {
+            withContext(Dispatchers.IO) { AvaultApi(current).movie(summary.id) }
+        } catch (e: UnauthorizedException) {
+            store.clear()
+            pairing = null
+            null
+        } catch (_: Exception) {
+            // The library card remains usable when a refresh temporarily fails.
+            summary
+        }
+    }
     LaunchedEffect(pairing) { if (pairing != null) connect() }
     BackHandler(enabled = pairing != null && (playing || selected != null || related != null || searching)) { when { playing -> playing = false; selected != null -> selected = null; related != null -> related = null; searching -> searching = false } }
     if (pairing == null) ConnectPage(onPaired = { store.save(it); pairing = it }, error = error) else Box(Modifier.fillMaxSize()) {
@@ -122,12 +135,12 @@ private fun watchStatusLabel(status: String) = when (status) { "watching" -> "�
                 }
             }
         }) { padding ->
-            HorizontalPager(state = pagerState, modifier = Modifier.padding(padding), beyondViewportPageCount = 2) { page -> when (tabs[page]) { "library" -> LibraryPage(pairing!!, { selected = it }, { store.clear(); pairing = null }, Modifier.fillMaxSize(), onSearch = { searching = true }); "actors" -> ActorLibraryPage(pairing!!, { related = "actor" to it }, { store.clear(); pairing = null }, Modifier.fillMaxSize()); else -> SettingsPage(pairing!!, error, { connect() }, { store.clear(); pairing = null }, Modifier.fillMaxSize()) } }
+            HorizontalPager(state = pagerState, modifier = Modifier.padding(padding), beyondViewportPageCount = 2) { page -> when (tabs[page]) { "library" -> LibraryPage(pairing!!, ::openMovie, { store.clear(); pairing = null }, Modifier.fillMaxSize(), onSearch = { searching = true }); "actors" -> ActorLibraryPage(pairing!!, { related = "actor" to it }, { store.clear(); pairing = null }, Modifier.fillMaxSize()); else -> SettingsPage(pairing!!, error, { connect() }, { store.clear(); pairing = null }, Modifier.fillMaxSize()) } }
         }
-        if (searching) Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) { SearchPage(pairing!!, { searching = false }, { selected = it }, { store.clear(); pairing = null }) }
+        if (searching) Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) { SearchPage(pairing!!, { searching = false }, ::openMovie, { store.clear(); pairing = null }) }
         when { selected != null && playing -> Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) { PlayerPage(selected!!, pairing!!, playFileId, onBack = { playing = false }, onUnauthorized = { store.clear(); pairing = null }) }
             selected != null -> MovieDetailPage(selected!!, pairing!!, onBack = { selected = null }, onPlay = { playFileId = it.id; playing = true }, onActor = { selected = null; related = "actor" to it }, onTag = { selected = null; related = "tag" to it }, onWatchStatusChange = { status -> selected = selected?.copy(watchStatus = status) })
-            related != null -> Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) { RelatedMoviesPage(pairing!!, related!!.first, related!!.second, { selected = it; related = null }, { related = null }, { store.clear(); pairing = null }) }
+            related != null -> Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) { RelatedMoviesPage(pairing!!, related!!.first, related!!.second, { related = null; openMovie(it) }, { related = null }, { store.clear(); pairing = null }) }
         }
     }
 }
@@ -144,24 +157,27 @@ private fun watchStatusLabel(status: String) = when (status) { "watching" -> "�
         if (next == watchStatus || updatingWatchStatus) return
         val previous = watchStatus
         watchStatus = next
+        onWatchStatusChange(next)
         updatingWatchStatus = true
         watchStatusError = null
-        scope.launch {
+        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
             try {
-                withContext(Dispatchers.IO) {
-                    AvaultApi(pairing).updateProgress(
-                        movie.id,
-                        movie.progressSeconds * 1_000,
-                        (movie.durationMinutes?.toLong() ?: 0L) * 60_000,
-                        next
-                    )
-                }
-                onWatchStatusChange(next)
+                AvaultApi(pairing).updateProgress(
+                    movie.id,
+                    movie.progressSeconds * 1_000,
+                    (movie.durationMinutes?.toLong() ?: 0L) * 60_000,
+                    next
+                )
             } catch (error: Exception) {
-                watchStatus = previous
-                watchStatusError = error.message ?: "观看状态更新失败"
+                withContext(Dispatchers.Main.immediate) {
+                    if (watchStatus == next) {
+                        watchStatus = previous
+                        onWatchStatusChange(previous)
+                        watchStatusError = error.message ?: "观看状态更新失败"
+                    }
+                }
             } finally {
-                updatingWatchStatus = false
+                withContext(Dispatchers.Main.immediate) { updatingWatchStatus = false }
             }
         }
     }
