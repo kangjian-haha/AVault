@@ -20,6 +20,7 @@ import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
@@ -507,6 +508,8 @@ private fun readSearchHistory(preferences: android.content.SharedPreferences): L
     var scrubPosition by remember { mutableLongStateOf(0L) }
     var scrubbing by remember { mutableStateOf(false) }
     var gestureText by remember { mutableStateOf<String?>(null) }
+    var lastGestureText by remember { mutableStateOf("") }
+    var gestureKind by remember { mutableStateOf("feedback") }
     var gestureActive by remember { mutableStateOf(false) }
 
     fun syncProgress(positionMs: Long, durationMs: Long, final: Boolean = false) {
@@ -560,6 +563,7 @@ private fun readSearchHistory(preferences: android.content.SharedPreferences): L
     }
     LaunchedEffect(player) { while (isActive) { position = player.currentPosition.coerceAtLeast(0L); duration = player.duration.coerceAtLeast(0L); delay(400) } }
     LaunchedEffect(controlsVisible) { if (controlsVisible) { delay(3_000); controlsVisible = false } }
+    LaunchedEffect(gestureText) { gestureText?.let { lastGestureText = it } }
     LaunchedEffect(gestureText, gestureActive) { if (gestureText != null && !gestureActive) { delay(700); if (!gestureActive) gestureText = null } }
     LaunchedEffect(player) { while (isActive) { delay(15_000); if (player.isPlaying) syncProgress(player.currentPosition, player.duration) } }
 
@@ -598,7 +602,8 @@ private fun readSearchHistory(preferences: android.content.SharedPreferences): L
                         gestureActive = true
                         controlsVisible = false
                         player.setPlaybackSpeed(2f)
-                        gestureText = "2× 倍速播放 · 右滑可切换 5×"
+                        gestureKind = "speed"
+                        gestureText = "2× 倍速"
                     }
                 }
                 try {
@@ -609,13 +614,14 @@ private fun readSearchHistory(preferences: android.content.SharedPreferences): L
                         val dy = change.position.y - down.position.y
                         if (!change.pressed) {
                             longPressJob.cancel()
-                            if (speedBoost) { player.setPlaybackSpeed(startPlaybackSpeed); gestureActive = false }
+                            if (speedBoost) { player.setPlaybackSpeed(startPlaybackSpeed); gestureActive = false; gestureText = null }
                             else when (mode) { 0 -> controlsVisible = !controlsVisible; 1 -> { seekTo(scrubPosition, showControls = false); gestureActive = false }; else -> gestureActive = false }
                             break
                         }
                         if (!speedBoost && mode == 0 && (abs(dx) > 32f || abs(dy) > 32f)) {
                             longPressJob.cancel()
                             mode = if (abs(dx) >= abs(dy) * 1.2f) 1 else if (down.position.x < size.width / 2f) 2 else 3
+                            gestureKind = "feedback"
                             gestureActive = true
                             controlsVisible = false
                         }
@@ -624,7 +630,7 @@ private fun readSearchHistory(preferences: android.content.SharedPreferences): L
                             if (shouldUseFiveTimes != fiveTimesSpeed) {
                                 fiveTimesSpeed = shouldUseFiveTimes
                                 player.setPlaybackSpeed(if (fiveTimesSpeed) 5f else 2f)
-                                gestureText = if (fiveTimesSpeed) "5× 倍速播放" else "2× 倍速播放 · 右滑可切换 5×"
+                                gestureText = if (fiveTimesSpeed) "5× 倍速" else "2× 倍速"
                             }
                         } else when (mode) {
                             1 -> { scrubPosition = (startPosition + (dx / size.width * 120_000f).roundToInt().toLong()).coerceIn(0L, gestureDuration); gestureText = "${formatPlaybackTime(scrubPosition)} / ${formatPlaybackTime(gestureDuration)}" }
@@ -640,7 +646,25 @@ private fun readSearchHistory(preferences: android.content.SharedPreferences): L
                 }
             }
         })
-        AnimatedVisibility(visible = gestureText != null, modifier = Modifier.align(androidx.compose.ui.Alignment.Center), enter = fadeIn(), exit = fadeOut()) { Surface(color = MaterialTheme.colorScheme.surface.copy(alpha = .88f), shape = MaterialTheme.shapes.medium) { Text(gestureText.orEmpty(), modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp), style = MaterialTheme.typography.titleMedium) } }
+        AnimatedVisibility(
+            visible = gestureText != null,
+            modifier = if (gestureKind == "speed") Modifier.align(androidx.compose.ui.Alignment.TopCenter).padding(top = 18.dp) else Modifier.align(androidx.compose.ui.Alignment.Center),
+            enter = fadeIn(animationSpec = tween(80)),
+            exit = fadeOut(animationSpec = tween(100))
+        ) {
+            val speedPrompt = gestureKind == "speed"
+            Surface(
+                color = androidx.compose.ui.graphics.Color.Black.copy(alpha = if (speedPrompt) .36f else .68f),
+                contentColor = androidx.compose.ui.graphics.Color.White.copy(alpha = .9f),
+                shape = if (speedPrompt) MaterialTheme.shapes.small else MaterialTheme.shapes.medium
+            ) {
+                Text(
+                    lastGestureText,
+                    modifier = Modifier.padding(horizontal = if (speedPrompt) 11.dp else 20.dp, vertical = if (speedPrompt) 5.dp else 12.dp),
+                    style = if (speedPrompt) MaterialTheme.typography.labelMedium else MaterialTheme.typography.titleMedium
+                )
+            }
+        }
         if (controlsVisible) {
             Box(Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color.Black.copy(alpha = .38f))) {
                 Row(Modifier.align(androidx.compose.ui.Alignment.TopStart).padding(12.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
