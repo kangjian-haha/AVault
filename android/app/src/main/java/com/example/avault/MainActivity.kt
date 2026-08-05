@@ -93,7 +93,11 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) { super.onCreate(savedInstanceState); enableEdgeToEdge(); setContent { AVaultTheme(darkTheme = true, dynamicColor = false) { AVaultApp() } } }
 }
 
-private fun RemoteFile.displayLabel(): String = versionLabel ?: name.substringAfterLast('@').substringBeforeLast('.').ifBlank { "本地版本" }
+private fun RemoteFile.displayLabel(movieCode: String? = null): String {
+    val primaryLabel = movieCode?.takeIf { it.isNotBlank() }
+        ?: name.substringAfterLast('@').substringBeforeLast('.').ifBlank { "本地版本" }
+    return listOfNotNull(primaryLabel, versionLabel?.takeIf { it.isNotBlank() }).joinToString(" · ")
+}
 private fun watchStatusLabel(status: String) = when (status) { "watching" -> "观看中"; "watched" -> "已看完"; else -> "未观看" }
 
 @Composable private fun AVaultApp() {
@@ -215,7 +219,7 @@ private fun watchStatusLabel(status: String) = when (status) { "watching" -> "�
         }
         if (movie.description.isNotBlank()) Text(movie.description, style = MaterialTheme.typography.bodyMedium)
         Text("选择播放版本", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(top = 4.dp))
-        movie.files.filter { it.available }.forEach { file -> Button(onClick = { onPlay(file) }, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.PlayArrow, null); Spacer(Modifier.width(8.dp)); Column { Text(file.displayLabel()); file.mediaInfo?.let { Text(listOfNotNull(it.videoCodec, it.container).joinToString(" · "), style = MaterialTheme.typography.labelSmall) } } } }
+        movie.files.filter { it.available }.forEach { file -> Button(onClick = { onPlay(file) }, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.PlayArrow, null); Spacer(Modifier.width(8.dp)); Column { Text(file.displayLabel(movie.code)); file.mediaInfo?.let { Text(listOfNotNull(it.videoCodec, it.container).joinToString(" · "), style = MaterialTheme.typography.labelSmall) } } } }
         if (movie.files.none { it.available }) Text("没有可播放的本地版本", color = MaterialTheme.colorScheme.error)
     }
 }
@@ -653,7 +657,7 @@ private fun readSearchHistory(preferences: android.content.SharedPreferences): L
                     Slider(value = (if (scrubbing) scrubPosition else position).toFloat(), onValueChange = { scrubPosition = it.toLong(); scrubbing = true }, onValueChangeFinished = { if (scrubbing) { seekTo(scrubPosition); scrubbing = false } }, valueRange = 0f..duration.coerceAtLeast(1L).toFloat())
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
                         Text("${formatPlaybackTime(if (scrubbing) scrubPosition else position)} / ${formatPlaybackTime(duration)}", style = MaterialTheme.typography.bodySmall)
-                        Text(file?.displayLabel().orEmpty(), style = MaterialTheme.typography.bodySmall)
+                        Text(file?.displayLabel(movie.code).orEmpty(), style = MaterialTheme.typography.bodySmall)
                     }
                 }
             }
@@ -663,7 +667,7 @@ private fun readSearchHistory(preferences: android.content.SharedPreferences): L
     if (versionSheetVisible) ModalBottomSheet(onDismissRequest = { versionSheetVisible = false }) {
         Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("播放版本", style = MaterialTheme.typography.titleLarge)
-            movie.files.filter { it.available }.forEach { candidate -> ListItem(headlineContent = { Text(candidate.displayLabel()) }, supportingContent = { Text(listOfNotNull(candidate.mediaInfo?.videoCodec, candidate.mediaInfo?.container).joinToString(" · ").ifBlank { "本地文件" }) }, trailingContent = { if (candidate.id == file?.id) Icon(Icons.Default.Check, null) }, modifier = Modifier.clickable { versionSheetVisible = false; play(candidate, player.currentPosition) }) }
+            movie.files.filter { it.available }.forEach { candidate -> ListItem(headlineContent = { Text(candidate.displayLabel(movie.code)) }, supportingContent = { Text(listOfNotNull(candidate.mediaInfo?.videoCodec, candidate.mediaInfo?.container).joinToString(" · ").ifBlank { "本地文件" }) }, trailingContent = { if (candidate.id == file?.id) Icon(Icons.Default.Check, null) }, modifier = Modifier.clickable { versionSheetVisible = false; play(candidate, player.currentPosition) }) }
             Spacer(Modifier.height(12.dp))
         }
     }
