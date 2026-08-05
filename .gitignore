@@ -29,6 +29,7 @@ android/app/build/
 
 # Local AVault data and test captures
 AVault-data/
-data/
+/data/
+/electron/data/
 android-*.png
 android/*.png

@@ -259,6 +259,7 @@ private fun RemoteFile.displayLabel(): String = versionLabel ?: name.substringAf
     var total by remember { mutableIntStateOf(0) }
     var sort by rememberSaveable { mutableStateOf("added-desc") }
     var status by rememberSaveable { mutableStateOf<String?>(null) }
+    var sourcePartition by rememberSaveable { mutableStateOf<String?>(uiPreferences.getString("movieSourcePartition", null)) }
     val grid = remember { uiPreferences.getBoolean("movieGrid", true) }
     val gridState = rememberSaveable(saver = LazyGridState.Saver) { LazyGridState() }
     val listState = rememberSaveable(saver = LazyListState.Saver) { LazyListState() }
@@ -270,11 +271,11 @@ private fun RemoteFile.displayLabel(): String = versionLabel ?: name.substringAf
         val serialized = JSONArray().also { array -> history.forEach(array::put) }.toString()
         preferences.edit().putString("recent", serialized).apply()
     }
-    fun request(reset: Boolean = true, queryValue: String = query, sortValue: String = sort, statusValue: String? = status) = scope.launch {
+    fun request(reset: Boolean = true, queryValue: String = query, sortValue: String = sort, statusValue: String? = status, sourcePartitionValue: String? = sourcePartition) = scope.launch {
         loading = true
         val target = if (reset) 1 else page + 1
         try {
-            val result = withContext(Dispatchers.IO) { AvaultApi(pairing).movies(page = target, query = queryValue, status = statusValue, sort = sortValue) }
+            val result = withContext(Dispatchers.IO) { AvaultApi(pairing).movies(page = target, query = queryValue, status = statusValue, sourcePartition = sourcePartitionValue, sort = sortValue) }
             movies = if (reset) result.items else movies + result.items
             page = result.page
             total = result.total
@@ -292,6 +293,7 @@ private fun RemoteFile.displayLabel(): String = versionLabel ?: name.substringAf
     }
     fun selectSort(value: String) { sort = value; request(queryValue = query, sortValue = value) }
     fun selectStatus(value: String?) { status = value; request(queryValue = query, statusValue = value) }
+    fun selectSourcePartition(value: String?) { sourcePartition = value; uiPreferences.edit().putString("movieSourcePartition", value).apply(); request(queryValue = query, sourcePartitionValue = value) }
 
     Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding()) {
         Row(Modifier.fillMaxWidth().height(56.dp).padding(horizontal = 8.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -317,7 +319,7 @@ private fun RemoteFile.displayLabel(): String = versionLabel ?: name.substringAf
                 else FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) { history.forEach { item -> AssistChip(onClick = { submit(item) }, label = { Text(item, maxLines = 1) }) } }
             }
         } else {
-            MovieFilterDropdowns(status, sort, ::selectStatus, ::selectSort)
+            MovieFilterDropdowns(sourcePartition, status, sort, ::selectSourcePartition, ::selectStatus, ::selectSort)
             if (loading) LinearProgressIndicator(Modifier.fillMaxWidth())
             error?.let { Text(it, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(16.dp)) }
             if (!loading && error == null && movies.isEmpty()) Box(Modifier.fillMaxSize(), contentAlignment = androidx.compose.ui.Alignment.Center) { Text("没有找到相关影片") }
@@ -337,12 +339,25 @@ private fun readSearchHistory(preferences: android.content.SharedPreferences): L
     (0 until values.length()).map { values.getString(it) }.filter { it.isNotBlank() }.take(10)
 }.getOrDefault(emptyList())
 
-@Composable private fun MovieFilterDropdowns(status: String?, sort: String, onStatusChange: (String?) -> Unit, onSortChange: (String) -> Unit) {
+@Composable private fun MovieFilterDropdowns(sourcePartition: String?, status: String?, sort: String, onSourcePartitionChange: (String?) -> Unit, onStatusChange: (String?) -> Unit, onSortChange: (String) -> Unit) {
+    var sourcePartitionExpanded by remember { mutableStateOf(false) }
     var statusExpanded by remember { mutableStateOf(false) }
     var sortExpanded by remember { mutableStateOf(false) }
+    val sourcePartitionLabel = when (sourcePartition) { "censored" -> "有码"; "fc2" -> "FC2"; "uncensored" -> "无码"; "leaked" -> "流出"; "unknown" -> "待分类"; else -> "全部片源" }
     val statusLabel = when (status) { "unwatched" -> "未观看"; "watching" -> "观看中"; "watched" -> "已看完"; else -> "全部状态" }
     val sortLabel = when (sort) { "release-desc" -> "发行日期（最新）"; else -> "加入时间（最新）" }
-    Row(Modifier.fillMaxWidth().height(48.dp).padding(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+    LazyRow(Modifier.fillMaxWidth().height(48.dp), contentPadding = PaddingValues(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+        item {
+            Box {
+                OutlinedButton(onClick = { sourcePartitionExpanded = true }, modifier = Modifier.height(36.dp), contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp)) { Text(sourcePartitionLabel); Spacer(Modifier.width(4.dp)); Icon(Icons.Default.KeyboardArrowDown, null, modifier = Modifier.size(16.dp)) }
+                DropdownMenu(expanded = sourcePartitionExpanded, onDismissRequest = { sourcePartitionExpanded = false }) {
+                    listOf(null to "全部片源", "censored" to "有码", "fc2" to "FC2", "uncensored" to "无码", "leaked" to "流出", "unknown" to "待分类").forEach { (value, label) ->
+                        DropdownMenuItem(modifier = Modifier.requiredHeight(40.dp), text = { Text(label, style = MaterialTheme.typography.bodyMedium) }, leadingIcon = { if (sourcePartition == value) Icon(Icons.Default.Check, null, modifier = Modifier.size(16.dp)) }, onClick = { sourcePartitionExpanded = false; onSourcePartitionChange(value) })
+                    }
+                }
+            }
+        }
+        item {
         Box {
             OutlinedButton(onClick = { statusExpanded = true }, modifier = Modifier.height(36.dp), contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp)) { Text(statusLabel); Spacer(Modifier.width(4.dp)); Icon(Icons.Default.KeyboardArrowDown, null, modifier = Modifier.size(16.dp)) }
             DropdownMenu(expanded = statusExpanded, onDismissRequest = { statusExpanded = false }) {
@@ -351,6 +366,8 @@ private fun readSearchHistory(preferences: android.content.SharedPreferences): L
                 }
             }
         }
+        }
+        item {
         Box {
             OutlinedButton(onClick = { sortExpanded = true }, modifier = Modifier.height(36.dp), contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp)) { Text(sortLabel); Spacer(Modifier.width(4.dp)); Icon(Icons.Default.KeyboardArrowDown, null, modifier = Modifier.size(16.dp)) }
             DropdownMenu(expanded = sortExpanded, onDismissRequest = { sortExpanded = false }) {
@@ -359,16 +376,51 @@ private fun readSearchHistory(preferences: android.content.SharedPreferences): L
                 }
             }
         }
+        }
     }
 }
 
 @Composable private fun LibraryPage(pairing: Pairing, onOpen: (RemoteMovie) -> Unit, onUnauthorized: () -> Unit, modifier: Modifier, onSearch: () -> Unit) {
-    val context = LocalContext.current; val uiPreferences = remember { context.getSharedPreferences("avault-ui", android.content.Context.MODE_PRIVATE) }; val scope = rememberCoroutineScope(); var query by remember { mutableStateOf("") }; var movies by remember { mutableStateOf<List<RemoteMovie>>(emptyList()) }; var page by remember { mutableIntStateOf(1) }; var total by remember { mutableIntStateOf(0) }; var status by remember { mutableStateOf<String?>(null) }; var sort by remember { mutableStateOf(uiPreferences.getString("movieSort", "added-desc") ?: "added-desc") }; var grid by remember { mutableStateOf(uiPreferences.getBoolean("movieGrid", true)) }; val gridState = rememberSaveable(saver = LazyGridState.Saver) { LazyGridState() }; val listState = rememberSaveable(saver = LazyListState.Saver) { LazyListState() }; var loading by remember { mutableStateOf(true) }; var error by remember { mutableStateOf<String?>(null) }
-    fun load(reset: Boolean = true) = scope.launch { loading = true; val target = if (reset) 1 else page + 1; try { val result = withContext(Dispatchers.IO) { AvaultApi(pairing).movies(page = target, query = query, status = status, sort = sort) }; movies = if (reset) result.items else movies + result.items; page = result.page; total = result.total; error = null } catch (e: UnauthorizedException) { onUnauthorized() } catch (e: Exception) { error = e.message } finally { loading = false } }
+    val context = LocalContext.current
+    val uiPreferences = remember { context.getSharedPreferences("avault-ui", android.content.Context.MODE_PRIVATE) }
+    val scope = rememberCoroutineScope()
+    var query by remember { mutableStateOf("") }
+    var movies by remember { mutableStateOf<List<RemoteMovie>>(emptyList()) }
+    var page by remember { mutableIntStateOf(1) }
+    var total by remember { mutableIntStateOf(0) }
+    var status by remember { mutableStateOf<String?>(null) }
+    var sourcePartition by remember { mutableStateOf<String?>(uiPreferences.getString("movieSourcePartition", null)) }
+    var sort by remember { mutableStateOf(uiPreferences.getString("movieSort", "added-desc") ?: "added-desc") }
+    var grid by remember { mutableStateOf(uiPreferences.getBoolean("movieGrid", true)) }
+    val gridState = rememberSaveable(saver = LazyGridState.Saver) { LazyGridState() }
+    val listState = rememberSaveable(saver = LazyListState.Saver) { LazyListState() }
+    var loading by remember { mutableStateOf(true) }
+    var error by remember { mutableStateOf<String?>(null) }
+
+    fun load(reset: Boolean = true) = scope.launch {
+        loading = true
+        val target = if (reset) 1 else page + 1
+        try {
+            val result = withContext(Dispatchers.IO) {
+                AvaultApi(pairing).movies(page = target, query = query, status = status, sourcePartition = sourcePartition, sort = sort)
+            }
+            movies = if (reset) result.items else movies + result.items
+            page = result.page
+            total = result.total
+            error = null
+        } catch (e: UnauthorizedException) {
+            onUnauthorized()
+        } catch (e: Exception) {
+            error = e.message ?: "无法加载媒体库"
+        } finally {
+            loading = false
+        }
+    }
     fun setSort(value: String) { sort = value; uiPreferences.edit().putString("movieSort", value).apply(); load() }
+    fun setSourcePartition(value: String?) { sourcePartition = value; uiPreferences.edit().putString("movieSourcePartition", value).apply(); load() }
     LaunchedEffect(Unit) { load() }
     Column(modifier.fillMaxSize()) { Row(Modifier.fillMaxWidth().height(44.dp).padding(horizontal = 12.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) { Text("AVault", style = MaterialTheme.typography.titleLarge); Row { IconButton(modifier = Modifier.size(36.dp), onClick = onSearch) { Icon(Icons.Default.Search, "搜索") }; IconButton(modifier = Modifier.size(36.dp), onClick = { grid = !grid; uiPreferences.edit().putBoolean("movieGrid", grid).apply() }) { Icon(if (grid) Icons.Default.ViewList else Icons.Default.GridView, if (grid) "切换为列表" else "切换为网格") }; IconButton(modifier = Modifier.size(36.dp), onClick = { load() }) { Icon(Icons.Default.Refresh, "刷新") } } }
-        MovieFilterDropdowns(status, sort, { status = it; load() }, ::setSort)
+        MovieFilterDropdowns(sourcePartition, status, sort, ::setSourcePartition, { status = it; load() }, ::setSort)
         if (loading) LinearProgressIndicator(Modifier.fillMaxWidth()); error?.let { Text(it, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(16.dp)) }
         if (grid) LazyVerticalGrid(GridCells.Fixed(3), Modifier.fillMaxSize().padding(start = 10.dp, top = 4.dp, end = 10.dp), state = gridState, horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) { if (loading && movies.isEmpty()) gridItems(List(9) { it }) { Card(Modifier.fillMaxWidth().aspectRatio(442f / 568f), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {} } else gridItems(movies) { movie -> Card(Modifier.fillMaxWidth().clickable { onOpen(movie) }) { Column { AuthenticatedMediaImage(movie.coverUrl, pairing, movie.title, Modifier.fillMaxWidth().aspectRatio(442f / 568f), alignment = androidx.compose.ui.Alignment.CenterEnd); Text(movie.code ?: "未识别", modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp), style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis) } } }; if (movies.size < total) item(span = { GridItemSpan(maxLineSpan) }) { Box(Modifier.fillMaxWidth(), contentAlignment = androidx.compose.ui.Alignment.Center) { OutlinedButton(onClick = { load(false) }, enabled = !loading) { Text("加载更多") } } } } else LazyColumn(Modifier.fillMaxSize().padding(start = 12.dp, top = 8.dp, end = 12.dp), state = listState, verticalArrangement = Arrangement.spacedBy(8.dp)) { if (loading && movies.isEmpty()) items(List(5) { it }) { Card(Modifier.fillMaxWidth().height(110.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {} } else items(movies) { movie -> Card(Modifier.fillMaxWidth().clickable { onOpen(movie) }) { Row(Modifier.padding(10.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) { AuthenticatedMediaImage(movie.coverUrl, pairing, movie.title, Modifier.width(150.dp).aspectRatio(840f / 568f)); Column(Modifier.weight(1f)) { Text(movie.code ?: "未识别", style = MaterialTheme.typography.titleMedium); Text(movie.title, maxLines = 2, style = MaterialTheme.typography.bodyMedium) } } } }; if (movies.size < total) item { Box(Modifier.fillMaxWidth(), contentAlignment = androidx.compose.ui.Alignment.Center) { OutlinedButton(onClick = { load(false) }, enabled = !loading) { Text("加载更多") } } } }
     }
