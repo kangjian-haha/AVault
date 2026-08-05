@@ -4303,6 +4303,15 @@ export function App() {
                     </SelectContent>
                   </Select>
                   <div className="ml-auto flex items-center gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => void refresh()}
+                      title="重新读取媒体库资料，不扫描文件"
+                    >
+                      <RefreshCw className="size-4" />
+                      刷新
+                    </Button>
                     {activeLibrary && <>
                       <div className="flex items-center gap-2 rounded-lg border border-white/[0.07] bg-white/[0.025] pl-3">
                         <span className="whitespace-nowrap text-xs text-zinc-500">默认分区</span>
