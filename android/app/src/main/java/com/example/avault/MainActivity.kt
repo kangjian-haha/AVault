@@ -94,6 +94,7 @@ class MainActivity : ComponentActivity() {
 }
 
 private fun RemoteFile.displayLabel(): String = versionLabel ?: name.substringAfterLast('@').substringBeforeLast('.').ifBlank { "本地版本" }
+private fun watchStatusLabel(status: String) = when (status) { "watching" -> "观看中"; "watched" -> "已看完"; else -> "未观看" }
 
 @Composable private fun AVaultApp() {
     val context = LocalContext.current; val store = remember { PairingStore(context) }; val scope = rememberCoroutineScope()
@@ -125,22 +126,63 @@ private fun RemoteFile.displayLabel(): String = versionLabel ?: name.substringAf
         }
         if (searching) Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) { SearchPage(pairing!!, { searching = false }, { selected = it }, { store.clear(); pairing = null }) }
         when { selected != null && playing -> Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) { PlayerPage(selected!!, pairing!!, playFileId, onBack = { playing = false }, onUnauthorized = { store.clear(); pairing = null }) }
-            selected != null -> MovieDetailPage(selected!!, pairing!!, onBack = { selected = null }, onPlay = { playFileId = it.id; playing = true }, onActor = { selected = null; related = "actor" to it }, onTag = { selected = null; related = "tag" to it })
+            selected != null -> MovieDetailPage(selected!!, pairing!!, onBack = { selected = null }, onPlay = { playFileId = it.id; playing = true }, onActor = { selected = null; related = "actor" to it }, onTag = { selected = null; related = "tag" to it }, onWatchStatusChange = { status -> selected = selected?.copy(watchStatus = status) })
             related != null -> Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) { RelatedMoviesPage(pairing!!, related!!.first, related!!.second, { selected = it; related = null }, { related = null }, { store.clear(); pairing = null }) }
         }
     }
 }
 
 @OptIn(ExperimentalLayoutApi::class)
-@Composable private fun MovieDetailPage(movie: RemoteMovie, pairing: Pairing, onBack: () -> Unit, onPlay: (RemoteFile) -> Unit, onActor: (String) -> Unit, onTag: (String) -> Unit) = Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background, contentColor = MaterialTheme.colorScheme.onBackground) {
+@Composable private fun MovieDetailPage(movie: RemoteMovie, pairing: Pairing, onBack: () -> Unit, onPlay: (RemoteFile) -> Unit, onActor: (String) -> Unit, onTag: (String) -> Unit, onWatchStatusChange: (String) -> Unit) = Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background, contentColor = MaterialTheme.colorScheme.onBackground) {
     val visibleTags = movie.tags.filterNot { it in movie.actors }.distinct()
+    val scope = rememberCoroutineScope()
+    var watchStatus by remember(movie.id, movie.watchStatus) { mutableStateOf(movie.watchStatus) }
+    var watchStatusExpanded by remember { mutableStateOf(false) }
+    var updatingWatchStatus by remember { mutableStateOf(false) }
+    var watchStatusError by remember { mutableStateOf<String?>(null) }
+    fun updateWatchStatus(next: String) {
+        if (next == watchStatus || updatingWatchStatus) return
+        val previous = watchStatus
+        watchStatus = next
+        updatingWatchStatus = true
+        watchStatusError = null
+        scope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    AvaultApi(pairing).updateProgress(
+                        movie.id,
+                        movie.progressSeconds * 1_000,
+                        (movie.durationMinutes?.toLong() ?: 0L) * 60_000,
+                        next
+                    )
+                }
+                onWatchStatusChange(next)
+            } catch (error: Exception) {
+                watchStatus = previous
+                watchStatusError = error.message ?: "观看状态更新失败"
+            } finally {
+                updatingWatchStatus = false
+            }
+        }
+    }
     Column(
         Modifier.fillMaxSize().statusBarsPadding().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 16.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
         AuthenticatedMediaImage(movie.coverUrl, pairing, movie.title, Modifier.fillMaxWidth().height(220.dp))
         Text(movie.title, style = MaterialTheme.typography.titleLarge)
-        movie.code?.let { Text("番号：$it", style = MaterialTheme.typography.bodyLarge) }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+            movie.code?.let { Text("番号：$it", style = MaterialTheme.typography.bodyLarge) }
+            Box {
+                OutlinedButton(onClick = { watchStatusExpanded = true }, enabled = !updatingWatchStatus, modifier = Modifier.height(36.dp), contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp)) { Text(watchStatusLabel(watchStatus)); Spacer(Modifier.width(4.dp)); Icon(Icons.Default.KeyboardArrowDown, null, modifier = Modifier.size(16.dp)) }
+                DropdownMenu(expanded = watchStatusExpanded, onDismissRequest = { watchStatusExpanded = false }) {
+                    listOf("unwatched", "watching", "watched").forEach { value ->
+                        DropdownMenuItem(text = { Text(watchStatusLabel(value)) }, leadingIcon = { if (watchStatus == value) Icon(Icons.Default.Check, null, modifier = Modifier.size(16.dp)) }, onClick = { watchStatusExpanded = false; updateWatchStatus(value) })
+                    }
+                }
+            }
+        }
+        watchStatusError?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
         movie.releaseDate?.let { Text("发行日期：$it", style = MaterialTheme.typography.bodyLarge) }
         movie.durationMinutes?.let { Text("时长：$it 分钟", style = MaterialTheme.typography.bodyLarge) }
         if (movie.actors.isNotEmpty()) Column(verticalArrangement = Arrangement.spacedBy(0.dp)) {
@@ -450,11 +492,7 @@ private fun readSearchHistory(preferences: android.content.SharedPreferences): L
     fun syncProgress(positionMs: Long, durationMs: Long, final: Boolean = false) {
         val safePosition = positionMs.coerceAtLeast(0L)
         val safeDuration = durationMs.coerceAtLeast(0L)
-        val status = when {
-            safeDuration > 0 && safePosition.toDouble() / safeDuration >= .9 -> "watched"
-            safePosition > 0 -> "watching"
-            else -> "unwatched"
-        }
+        val status = movie.watchStatus
         if (final) {
             // The remembered Compose scope is cancelled while this page leaves composition.
             // Use a short-lived independent job so the final update survives player disposal.
