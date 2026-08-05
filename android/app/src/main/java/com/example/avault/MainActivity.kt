@@ -9,6 +9,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -60,8 +61,8 @@ import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
-import androidx.compose.material.icons.filled.Replay10
-import androidx.compose.material.icons.filled.Forward10
+import androidx.compose.material.icons.filled.FastRewind
+import androidx.compose.material.icons.filled.FastForward
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
@@ -511,6 +512,9 @@ private fun readSearchHistory(preferences: android.content.SharedPreferences): L
     var lastGestureText by remember { mutableStateOf("") }
     var gestureKind by remember { mutableStateOf("feedback") }
     var gestureActive by remember { mutableStateOf(false) }
+    var lastTapAt by remember { mutableLongStateOf(0L) }
+    var lastTapOnLeft by remember { mutableStateOf(false) }
+    var singleTapJob by remember { mutableStateOf<Job?>(null) }
 
     fun syncProgress(positionMs: Long, durationMs: Long, final: Boolean = false) {
         val safePosition = positionMs.coerceAtLeast(0L)
@@ -598,6 +602,8 @@ private fun readSearchHistory(preferences: android.content.SharedPreferences): L
                 val longPressJob = scope.launch {
                     delay(500)
                     if (mode == 0) {
+                        singleTapJob?.cancel()
+                        lastTapAt = 0L
                         speedBoost = true
                         gestureActive = true
                         controlsVisible = false
@@ -615,11 +621,43 @@ private fun readSearchHistory(preferences: android.content.SharedPreferences): L
                         if (!change.pressed) {
                             longPressJob.cancel()
                             if (speedBoost) { player.setPlaybackSpeed(startPlaybackSpeed); gestureActive = false; gestureText = null }
-                            else when (mode) { 0 -> controlsVisible = !controlsVisible; 1 -> { seekTo(scrubPosition, showControls = false); gestureActive = false }; else -> gestureActive = false }
+                            else when (mode) {
+                                0 -> {
+                                    val tappedLeft = down.position.x < size.width / 2f
+                                    val now = SystemClock.uptimeMillis()
+                                    val doubleTap = now - lastTapAt <= 280L && tappedLeft == lastTapOnLeft
+                                    if (doubleTap) {
+                                        singleTapJob?.cancel()
+                                        lastTapAt = 0L
+                                        val delta = if (tappedLeft) -15_000L else 15_000L
+                                        val maximum = player.duration.takeIf { it > 0L } ?: Long.MAX_VALUE
+                                        val target = (player.currentPosition + delta).coerceIn(0L, maximum)
+                                        player.seekTo(target)
+                                        position = target
+                                        gestureKind = "feedback"
+                                        gestureText = if (tappedLeft) "快退 15 秒" else "快进 15 秒"
+                                    } else {
+                                        lastTapAt = now
+                                        lastTapOnLeft = tappedLeft
+                                        singleTapJob?.cancel()
+                                        singleTapJob = scope.launch {
+                                            delay(280)
+                                            if (lastTapAt == now) {
+                                                controlsVisible = !controlsVisible
+                                                lastTapAt = 0L
+                                            }
+                                        }
+                                    }
+                                }
+                                1 -> { seekTo(scrubPosition, showControls = false); gestureActive = false }
+                                else -> gestureActive = false
+                            }
                             break
                         }
                         if (!speedBoost && mode == 0 && (abs(dx) > 32f || abs(dy) > 32f)) {
                             longPressJob.cancel()
+                            singleTapJob?.cancel()
+                            lastTapAt = 0L
                             mode = if (abs(dx) >= abs(dy) * 1.2f) 1 else if (down.position.x < size.width / 2f) 2 else 3
                             gestureKind = "feedback"
                             gestureActive = true
@@ -673,9 +711,9 @@ private fun readSearchHistory(preferences: android.content.SharedPreferences): L
                 }
                 IconButton(modifier = Modifier.align(androidx.compose.ui.Alignment.TopEnd).padding(12.dp), onClick = { versionSheetVisible = true }) { Icon(Icons.Default.Settings, "播放设置") }
                 Row(Modifier.align(androidx.compose.ui.Alignment.Center), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(18.dp)) {
-                    IconButton(onClick = { seekTo(player.currentPosition - 10_000) }) { Icon(Icons.Default.Replay10, "快退 10 秒") }
-                    IconButton(modifier = Modifier.size(64.dp), onClick = { if (player.isPlaying) player.pause() else player.play() }) { Icon(if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow, if (isPlaying) "暂停" else "播放", modifier = Modifier.size(48.dp)) }
-                    IconButton(onClick = { seekTo(player.currentPosition + 10_000) }) { Icon(Icons.Default.Forward10, "快进 10 秒") }
+                    IconButton(modifier = Modifier.size(60.dp), onClick = { seekTo(player.currentPosition - 15_000) }) { Icon(Icons.Default.FastRewind, "快退 15 秒", modifier = Modifier.size(36.dp)) }
+                    IconButton(modifier = Modifier.size(72.dp), onClick = { if (player.isPlaying) player.pause() else player.play() }) { Icon(if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow, if (isPlaying) "暂停" else "播放", modifier = Modifier.size(54.dp)) }
+                    IconButton(modifier = Modifier.size(60.dp), onClick = { seekTo(player.currentPosition + 15_000) }) { Icon(Icons.Default.FastForward, "快进 15 秒", modifier = Modifier.size(36.dp)) }
                 }
                 Column(Modifier.align(androidx.compose.ui.Alignment.BottomCenter).fillMaxWidth().padding(horizontal = 18.dp, vertical = 14.dp)) {
                     Slider(value = (if (scrubbing) scrubPosition else position).toFloat(), onValueChange = { scrubPosition = it.toLong(); scrubbing = true }, onValueChangeFinished = { if (scrubbing) { seekTo(scrubPosition); scrubbing = false } }, valueRange = 0f..duration.coerceAtLeast(1L).toFloat())
