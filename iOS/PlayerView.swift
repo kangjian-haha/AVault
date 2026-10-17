@@ -17,6 +17,7 @@ struct PlayerView: View {
     @State private var hint: PlayerHint?
     @State private var previewTime: Double?
     @State private var hideTask: Task<Void, Never>?
+    @State private var hideGeneration = 0
     @State private var gestureStartTime = 0.0
     @State private var gestureStartBrightness = 0.5
     @State private var gestureStartVolume = 0.5
@@ -32,11 +33,12 @@ struct PlayerView: View {
             PlayerGestureLayer(
                 onTap: { toggleControls() },
                 onDoubleTap: { location, size in handleDoubleTap(location: location, size: size) },
-                onLongPress: { began in handleLongPress(began) },
+                onLongPressBegan: { beginLongPress() },
+                onLongPressEnded: { finishLongPress() },
                 onDragChanged: { value, size in handleDragChanged(value, size: size) },
                 onDragEnded: { value, size in handleDragEnded(value, size: size) }
-            )
-            if controlsVisible { PlayerControlsOverlay(playback: playback, onClose: closePlayer, onToggle: toggleControls, onOrientation: toggleOrientation, isLandscape: isLandscape, onInteraction: scheduleHide) }
+            ).frame(maxWidth: .infinity, maxHeight: .infinity).ignoresSafeArea()
+            if controlsVisible { PlayerControlsOverlay(playback: playback, onClose: closePlayer, onOrientation: toggleOrientation, isLandscape: isLandscape, onInteraction: scheduleHide) }
             if let hint { PlayerHintOverlay(hint: hint, previewTime: previewTime, duration: playback.duration) }
             if let error = playback.error { PlayerErrorOverlay(message: error, retry: { playback.open(file: file, position: 0) }) }
         }
@@ -45,33 +47,63 @@ struct PlayerView: View {
         .onChange(of: scenePhase) { _, phase in if phase != .active { playback.player.pause(); Task { await playback.sync() } } }
     }
 
-    private func toggleControls() { controlsVisible.toggle(); if controlsVisible { scheduleHide() } else { hideTask?.cancel() } }
-    private func scheduleHide() { hideTask?.cancel(); hideTask = Task { try? await Task.sleep(for: .seconds(3)); guard !Task.isCancelled else { return }; await MainActor.run { controlsVisible = false; hint = nil } } }
-    private func showHint(_ value: PlayerHint, preview: Double? = nil) { hint = value; previewTime = preview; controlsVisible = true; scheduleHide() }
-    private func handleDoubleTap(location: CGPoint, size: CGSize) { let delta = location.x < size.width / 2 ? -15.0 : 15.0; playback.seek(to: playback.position + delta); showHint(delta < 0 ? .seekBackward : .seekForward) }
-
-    private func handleLongPress(_ began: Bool) {
-        if began {
-            guard !longPressActive else { return }
-            longPressActive = true
-            gestureStartSpeed = playback.playbackRate
-            playback.setRate(2)
-            showHint(.speed(2))
-        } else if longPressActive {
-            longPressActive = false
-            playback.setRate(gestureStartSpeed)
-            showHint(.speed(gestureStartSpeed))
+    private func toggleControls() {
+        controlsVisible.toggle()
+        if controlsVisible {
+            scheduleHide()
+        } else {
+            hideGeneration &+= 1
+            hideTask?.cancel()
+            hint = nil
+            previewTime = nil
         }
     }
 
-    private func handleDragChanged(_ value: DragGesture.Value, size: CGSize) {
+    private func scheduleHide() {
+        hideTask?.cancel()
+        hideGeneration &+= 1
+        let generation = hideGeneration
+        hideTask = Task { [generation] in
+            do {
+                try await Task.sleep(for: .seconds(3))
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                guard generation == hideGeneration else { return }
+                controlsVisible = false
+                hint = nil
+                previewTime = nil
+            }
+        }
+    }
+    private func showHint(_ value: PlayerHint, preview: Double? = nil) { hint = value; previewTime = preview; controlsVisible = true; scheduleHide() }
+    private func handleDoubleTap(location: CGPoint, size: CGSize) { let delta = location.x < size.width / 2 ? -15.0 : 15.0; playback.seek(to: playback.currentTime + delta); showHint(delta < 0 ? .seekBackward : .seekForward) }
+
+    private func beginLongPress() {
+        guard !longPressActive else { return }
+        longPressActive = true
+        dragMode = nil
+        previewTime = nil
+        gestureStartSpeed = playback.playbackRate
+        playback.setRate(2)
+        showHint(.speed(2))
+    }
+
+    private func handleDragChanged(_ value: PlayerDragValue, size: CGSize) {
         if longPressActive {
-            if value.translation.width > 70, playback.playbackRate != 5 { playback.setRate(5); showHint(.speed(5)) }
-            if value.translation.width < 35, playback.playbackRate != 2 { playback.setRate(2); showHint(.speed(2)) }
+            if value.translation.width > 70, playback.playbackRate != 5 {
+                playback.setRate(5)
+                showHint(.speed(5))
+            } else if value.translation.width < 35, playback.playbackRate != 2 {
+                playback.setRate(2)
+                showHint(.speed(2))
+            }
             return
         }
         if dragMode == nil {
-            gestureStartTime = playback.position; gestureStartBrightness = UIScreen.main.brightness; gestureStartVolume = VolumeController.shared.volume
+            gestureStartTime = playback.currentTime; gestureStartBrightness = UIScreen.main.brightness; gestureStartVolume = VolumeController.shared.volume
             dragMode = abs(value.translation.width) >= abs(value.translation.height) ? .seek : (value.startLocation.x < size.width / 2 ? .brightness : .volume)
         }
         switch dragMode {
@@ -86,11 +118,17 @@ struct PlayerView: View {
         }
     }
 
-    private func handleDragEnded(_ value: DragGesture.Value, size: CGSize) {
-        if dragMode == .seek, let previewTime { playback.seek(to: previewTime) }
+    private func handleDragEnded(_ value: PlayerDragValue, size: CGSize) {
+        if !longPressActive, dragMode == .seek, let previewTime { playback.seek(to: previewTime) }
         dragMode = nil; previewTime = nil
-        if longPressActive { longPressActive = false; playback.setRate(gestureStartSpeed) }
         scheduleHide()
+    }
+
+    private func finishLongPress() {
+        guard longPressActive else { return }
+        longPressActive = false
+        playback.setRate(gestureStartSpeed)
+        showHint(.speed(gestureStartSpeed))
     }
 
     private func closePlayer() { Task { await playback.sync(); playback.player.pause(); dismiss() } }
@@ -106,21 +144,37 @@ private enum PlayerHint: Equatable { case seekBackward, seekForward, seekPreview
 private struct PlayerControlsOverlay: View {
     @ObservedObject var playback: Playback
     let onClose: () -> Void
-    let onToggle: () -> Void
     let onOrientation: () -> Void
     let isLandscape: Bool
     let onInteraction: () -> Void
+    @State private var isScrubbing = false
+    @State private var scrubTime = 0.0
     var body: some View {
         VStack(spacing: 0) {
             HStack { Button { onClose() } label: { Image(systemName: "chevron.left").font(.title3.weight(.semibold)).frame(width: 44, height: 44) }.accessibilityLabel("返回影片详情"); Spacer() }.padding(.top, 12).padding(.horizontal, 16)
             Spacer()
             HStack(spacing: 28) {
-                Button { playback.seek(to: playback.position - 15); onInteraction() } label: { Image(systemName: "gobackward.15").font(.system(size: 36, weight: .medium)).frame(width: 64, height: 64) }.accessibilityLabel("后退 15 秒")
+                Button { playback.seek(to: playback.currentTime - 15); onInteraction() } label: { Image(systemName: "gobackward.15").font(.system(size: 36, weight: .medium)).frame(width: 64, height: 64) }.accessibilityLabel("后退 15 秒")
                 Button { playback.togglePlayPause(); onInteraction() } label: { Image(systemName: playback.isPlaying ? "pause.circle.fill" : "play.circle.fill").font(.system(size: 54, weight: .regular)).frame(width: 72, height: 72) }.accessibilityLabel(playback.isPlaying ? "暂停" : "播放")
-                Button { playback.seek(to: playback.position + 15); onInteraction() } label: { Image(systemName: "goforward.15").font(.system(size: 36, weight: .medium)).frame(width: 64, height: 64) }.accessibilityLabel("前进 15 秒")
+                Button { playback.seek(to: playback.currentTime + 15); onInteraction() } label: { Image(systemName: "goforward.15").font(.system(size: 36, weight: .medium)).frame(width: 64, height: 64) }.accessibilityLabel("前进 15 秒")
             }
             VStack(spacing: 8) {
-                Slider(value: Binding(get: { playback.currentTime }, set: { playback.seek(to: $0) }), in: 0...max(playback.duration, 0.1), onEditingChanged: { _ in onInteraction() }).tint(.white).accessibilityLabel("播放进度")
+                Slider(
+                    value: Binding(
+                        get: { isScrubbing ? scrubTime : playback.currentTime },
+                        set: { scrubTime = min(max($0, 0), max(playback.duration, 0)) }
+                    ),
+                    in: 0...max(playback.duration, 0.1),
+                    onEditingChanged: { editing in
+                        isScrubbing = editing
+                        if editing {
+                            scrubTime = playback.currentTime
+                        } else {
+                            playback.seek(to: scrubTime)
+                        }
+                        onInteraction()
+                    }
+                ).tint(.white).accessibilityLabel("播放进度")
                 HStack {
                     Text(timeLabel(playback.currentTime)); Spacer(); Text(timeLabel(playback.duration))
                     Menu {
@@ -136,25 +190,136 @@ private struct PlayerControlsOverlay: View {
                     Button { onOrientation() } label: { Image(systemName: isLandscape ? "rectangle.portrait.rotate" : "rectangle.landscape.rotate").font(.title3).frame(width: 44, height: 44) }.accessibilityLabel(isLandscape ? "切换并锁定竖屏" : "切换并锁定横屏")
                 }.font(.caption.monospacedDigit())
             }.padding(.horizontal, 16).padding(.bottom, 20)
-        }.foregroundStyle(.white).background(LinearGradient(colors: [.black.opacity(0.72), .clear, .black.opacity(0.86)], startPoint: .top, endPoint: .bottom).ignoresSafeArea()).contentShape(Rectangle()).onTapGesture { onToggle() }.transition(.opacity)
+        }
+        .foregroundStyle(.white)
+        .background {
+            LinearGradient(colors: [.black.opacity(0.72), .clear, .black.opacity(0.86)], startPoint: .top, endPoint: .bottom)
+                .ignoresSafeArea()
+                .allowsHitTesting(false)
+        }
+        .transition(.opacity)
     }
     private func timeLabel(_ seconds: Double) -> String { let total = max(0, Int(seconds.isFinite ? seconds.rounded(.down) : 0)); return String(format: "%02d:%02d", total / 60, total % 60) }
 }
 
-private struct PlayerGestureLayer: View {
+private struct PlayerDragValue {
+    let translation: CGSize
+    let startLocation: CGPoint
+}
+
+private struct PlayerGestureLayer: UIViewRepresentable {
     let onTap: () -> Void
     let onDoubleTap: (CGPoint, CGSize) -> Void
-    let onLongPress: (Bool) -> Void
-    let onDragChanged: (DragGesture.Value, CGSize) -> Void
-    let onDragEnded: (DragGesture.Value, CGSize) -> Void
-    var body: some View {
-        GeometryReader { geometry in
-            Color.clear.contentShape(Rectangle())
-                .onTapGesture { onTap() }
-                .simultaneousGesture(SpatialTapGesture(count: 2).onEnded { value in onDoubleTap(value.location, geometry.size) })
-                .simultaneousGesture(DragGesture(minimumDistance: 8).onChanged { onDragChanged($0, geometry.size) }.onEnded { onDragEnded($0, geometry.size) })
-                .simultaneousGesture(LongPressGesture(minimumDuration: 0.45).onChanged { _ in onLongPress(true) }.onEnded { _ in onLongPress(false) })
-        }.ignoresSafeArea()
+    let onLongPressBegan: () -> Void
+    let onLongPressEnded: () -> Void
+    let onDragChanged: (PlayerDragValue, CGSize) -> Void
+    let onDragEnded: (PlayerDragValue, CGSize) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
+
+    func makeUIView(context: Context) -> UIView {
+        let view = GestureView()
+        view.backgroundColor = .clear
+        view.isMultipleTouchEnabled = false
+
+        let singleTap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleSingleTap(_:)))
+        singleTap.numberOfTapsRequired = 1
+        singleTap.cancelsTouchesInView = false
+
+        let doubleTap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleDoubleTap(_:)))
+        doubleTap.numberOfTapsRequired = 2
+        doubleTap.cancelsTouchesInView = false
+
+        let longPress = UILongPressGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleLongPress(_:)))
+        longPress.minimumPressDuration = 0.45
+        longPress.allowableMovement = 30
+        longPress.cancelsTouchesInView = false
+
+        let pan = UIPanGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handlePan(_:)))
+        pan.minimumNumberOfTouches = 1
+        pan.maximumNumberOfTouches = 1
+        pan.cancelsTouchesInView = false
+
+        singleTap.require(toFail: doubleTap)
+        singleTap.require(toFail: longPress)
+        singleTap.delegate = context.coordinator
+        doubleTap.delegate = context.coordinator
+        longPress.delegate = context.coordinator
+        pan.delegate = context.coordinator
+        view.addGestureRecognizer(singleTap)
+        view.addGestureRecognizer(doubleTap)
+        view.addGestureRecognizer(longPress)
+        view.addGestureRecognizer(pan)
+        context.coordinator.singleTap = singleTap
+        context.coordinator.doubleTap = doubleTap
+        context.coordinator.longPress = longPress
+        context.coordinator.pan = pan
+        return view
+    }
+
+    func updateUIView(_ view: UIView, context: Context) {
+        context.coordinator.parent = self
+    }
+
+    final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+        var parent: PlayerGestureLayer
+        weak var singleTap: UITapGestureRecognizer?
+        weak var doubleTap: UITapGestureRecognizer?
+        weak var longPress: UILongPressGestureRecognizer?
+        weak var pan: UIPanGestureRecognizer?
+        private var dragStartLocation = CGPoint.zero
+
+        init(parent: PlayerGestureLayer) { self.parent = parent }
+
+        @objc func handleSingleTap(_ recognizer: UITapGestureRecognizer) {
+            parent.onTap()
+        }
+
+        @objc func handleDoubleTap(_ recognizer: UITapGestureRecognizer) {
+            guard let view = recognizer.view else { return }
+            parent.onDoubleTap(recognizer.location(in: view), view.bounds.size)
+        }
+
+        @objc func handleLongPress(_ recognizer: UILongPressGestureRecognizer) {
+            switch recognizer.state {
+            case .began:
+                parent.onLongPressBegan()
+            case .ended, .cancelled, .failed:
+                parent.onLongPressEnded()
+            default:
+                break
+            }
+        }
+
+        @objc func handlePan(_ recognizer: UIPanGestureRecognizer) {
+            guard let view = recognizer.view else { return }
+            let point = recognizer.translation(in: view)
+            let translation = CGSize(width: point.x, height: point.y)
+            let value = PlayerDragValue(translation: translation, startLocation: dragStartLocation)
+            switch recognizer.state {
+            case .began:
+                dragStartLocation = recognizer.location(in: view)
+                parent.onDragChanged(PlayerDragValue(translation: .zero, startLocation: dragStartLocation), view.bounds.size)
+            case .changed:
+                parent.onDragChanged(value, view.bounds.size)
+            case .ended, .cancelled, .failed:
+                parent.onDragEnded(value, view.bounds.size)
+            default:
+                break
+            }
+        }
+
+        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+            true
+        }
+
+        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRequireFailureOf otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+            false
+        }
+    }
+
+    private final class GestureView: UIView {
+        override func point(inside point: CGPoint, with event: UIEvent?) -> Bool { true }
     }
 }
 
@@ -198,20 +363,110 @@ private final class VolumeController {
     private var observation: NSKeyValueObservation?
     private var pauseObservation: NSKeyValueObservation?
     private var notification: NSObjectProtocol?
-    var position: Double { let seconds = player.currentTime().seconds; return seconds.isFinite ? max(0, seconds) : 0 }
+    private var seekGeneration = 0
+    private var isSeeking = false
+    private var pendingSeekTime: Double?
+    private var wantsPlayback = false
+    private var actualPosition: Double {
+        let seconds = player.currentTime().seconds
+        return seconds.isFinite ? max(0, seconds) : 0
+    }
+    var position: Double { pendingSeekTime ?? actualPosition }
 
     func configure(movie: Movie, pairing: Pairing, onError: @escaping (Error) -> Void) {
         self.movie = movie; self.pairing = pairing; self.onError = onError
         pauseObservation = player.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in Task { @MainActor in self?.isPlaying = player.timeControlStatus == .playing; if player.timeControlStatus == .paused, player.currentItem != nil { await self?.sync() } } }
         timer?.cancel(); timer = Task { [weak self] in while !Task.isCancelled { try? await Task.sleep(for: .seconds(15)); await self?.sync() } }
-        progressTimer?.cancel(); progressTimer = Task { [weak self] in while !Task.isCancelled { try? await Task.sleep(for: .milliseconds(200)); guard !Task.isCancelled else { return }; await MainActor.run { guard let self else { return }; currentTime = position; let value = player.currentItem?.duration.seconds ?? 0; duration = value.isFinite ? max(0, value) : 0; isPlaying = player.timeControlStatus == .playing } } }
+        progressTimer?.cancel(); progressTimer = Task { [weak self] in while !Task.isCancelled { try? await Task.sleep(for: .milliseconds(200)); guard !Task.isCancelled else { return }; await MainActor.run { guard let self else { return }; let actual = self.actualPosition; if let pending = self.pendingSeekTime { self.currentTime = pending; if abs(actual - pending) < 0.5 { self.pendingSeekTime = nil; self.isSeeking = false; self.currentTime = actual } } else if !self.isSeeking { self.currentTime = actual }; let value = self.player.currentItem?.duration.seconds ?? 0; self.duration = value.isFinite ? max(0, value) : 0; self.isPlaying = self.player.timeControlStatus == .playing } } }
         notification = NotificationCenter.default.addObserver(forName: AVPlayerItem.didPlayToEndTimeNotification, object: nil, queue: .main) { [weak self] _ in Task { @MainActor in await self?.sync() } }
     }
 
-    func open(file: RemoteFile, position: Double) { guard let pairing else { return }; error = nil; videoMonitor?.cancel(); do { let url = try API(pairing: pairing).url("/api/v1/files/\(API.segment(file.id))/stream"); let asset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": ["Authorization": "Bearer \(pairing.token)"]]); let item = AVPlayerItem(asset: asset); observation = item.observe(\.status, options: [.new]) { [weak self] item, _ in if item.status == .failed { Task { @MainActor in self?.error = "无法播放此文件。iOS 可能不支持此容器或编码。" } } }; player.replaceCurrentItem(with: item); player.rate = 0; playbackRate = 1; player.seek(to: CMTime(seconds: max(0, position), preferredTimescale: 600)); currentTime = max(0, position); duration = 0; player.play(); videoMonitor = Task { [weak self, weak item] in for _ in 0..<8 { try? await Task.sleep(for: .seconds(1)); guard !Task.isCancelled else { return }; if let item, item.status == .readyToPlay, item.presentationSize.width > 0, item.presentationSize.height > 0 { return } }; guard let self, let item, item.status == .readyToPlay, self.player.timeControlStatus == .playing else { return }; self.error = "视频轨道无法显示。该文件可能使用了当前 iPhone 不支持的 H.264/H.265 编码或容器格式。" } } catch { self.error = error.localizedDescription } }
-    func togglePlayPause() { if player.timeControlStatus == .playing { player.pause() } else { player.playImmediately(atRate: Float(playbackRate)) } }
-    func setRate(_ value: Double) { playbackRate = min(max(value, 0.5), 5); if player.timeControlStatus == .playing { player.rate = Float(playbackRate) } }
-    func seek(to seconds: Double) { let value = max(0, min(seconds, duration > 0 ? duration : seconds)); currentTime = value; player.seek(to: CMTime(seconds: value, preferredTimescale: 600)) }
+    func open(file: RemoteFile, position: Double) {
+        guard let pairing else { return }
+        error = nil
+        videoMonitor?.cancel()
+        do {
+            let url = try API(pairing: pairing).url("/api/v1/files/\(API.segment(file.id))/stream")
+            let asset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": ["Authorization": "Bearer \(pairing.token)"]])
+            let item = AVPlayerItem(asset: asset)
+            observation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
+                if item.status == .failed {
+                    Task { @MainActor in self?.error = "无法播放此文件。iOS 可能不支持此容器或编码。" }
+                }
+            }
+            playbackRate = 1
+            player.defaultRate = 1
+            wantsPlayback = true
+            player.pause()
+            player.replaceCurrentItem(with: item)
+            player.rate = 0
+            let startTime = max(0, position)
+            currentTime = startTime
+            duration = 0
+            seekGeneration &+= 1
+            let generation = seekGeneration
+            isSeeking = true
+            pendingSeekTime = startTime
+            player.seek(to: CMTime(seconds: startTime, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak item] finished in
+                Task { @MainActor [weak self, weak item] in
+                    guard finished, let self, let item, self.player.currentItem === item, self.seekGeneration == generation else { return }
+                    self.player.playImmediately(atRate: 1)
+                }
+            }
+            videoMonitor = Task { [weak self, weak item] in
+                for _ in 0..<8 {
+                    try? await Task.sleep(for: .seconds(1))
+                    guard !Task.isCancelled else { return }
+                    if let item, item.status == .readyToPlay, item.presentationSize.width > 0, item.presentationSize.height > 0 { return }
+                }
+                guard let self, let item, item.status == .readyToPlay, self.player.timeControlStatus == .playing else { return }
+                self.error = "视频轨道无法显示。该文件可能使用了当前 iPhone 不支持的 H.264/H.265 编码或容器格式。"
+            }
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+    func togglePlayPause() {
+        if player.timeControlStatus == .playing || wantsPlayback {
+            wantsPlayback = false
+            player.pause()
+        } else {
+            wantsPlayback = true
+            player.playImmediately(atRate: Float(playbackRate))
+        }
+    }
+    func setRate(_ value: Double) {
+        playbackRate = min(max(value, 0.5), 5)
+        player.defaultRate = Float(playbackRate)
+        if wantsPlayback { player.playImmediately(atRate: Float(playbackRate)) }
+    }
+    func seek(to seconds: Double) {
+        guard seconds.isFinite else { return }
+        let upperBound = duration > 0 ? duration : max(seconds, currentTime)
+        let value = max(0, min(seconds, upperBound))
+        let resumeAfterSeek = wantsPlayback || player.timeControlStatus == .playing
+        currentTime = value
+        pendingSeekTime = value
+        seekGeneration &+= 1
+        let generation = seekGeneration
+        isSeeking = true
+        if resumeAfterSeek {
+            wantsPlayback = true
+            player.pause()
+        }
+        player.seek(to: CMTime(seconds: value, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
+            Task { @MainActor [weak self] in
+                guard let self, self.seekGeneration == generation else { return }
+                guard finished else {
+                    self.pendingSeekTime = nil
+                    self.isSeeking = false
+                    self.currentTime = self.actualPosition
+                    return
+                }
+                if resumeAfterSeek { self.player.playImmediately(atRate: Float(self.playbackRate)) }
+            }
+        }
+    }
     func sync() async { guard let pairing, let movie else { return }; do { try await API(pairing: pairing).progress(id: movie.id, position: position, duration: player.currentItem?.duration.seconds ?? 0) } catch { self.error = "播放进度同步失败：\(error.localizedDescription)"; onError?(error) } }
-    func stop() { timer?.cancel(); progressTimer?.cancel(); videoMonitor?.cancel(); observation = nil; pauseObservation = nil; if let notification { NotificationCenter.default.removeObserver(notification); self.notification = nil }; player.pause(); Task { await sync(); player.replaceCurrentItem(with: nil) } }
+    func stop() { timer?.cancel(); progressTimer?.cancel(); videoMonitor?.cancel(); seekGeneration &+= 1; pendingSeekTime = nil; isSeeking = false; observation = nil; pauseObservation = nil; if let notification { NotificationCenter.default.removeObserver(notification); self.notification = nil }; player.pause(); Task { await sync(); player.replaceCurrentItem(with: nil) } }
 }
