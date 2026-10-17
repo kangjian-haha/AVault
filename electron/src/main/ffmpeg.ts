@@ -7,8 +7,17 @@ import type { FfmpegStatus, MediaInfo, ToolEncodeOptions, ToolTask, TranscodeKin
 
 const execFileAsync = promisify(execFile)
 
-type ProbeStream = { codec_type?: string; codec_name?: string; profile?: string; tags?: Record<string, string>; width?: number; height?: number; avg_frame_rate?: string; bit_rate?: string; pix_fmt?: string; color_transfer?: string; channels?: number }
+type ProbeStream = { codec_type?: string; codec_name?: string; codec_tag_string?: string; profile?: string; tags?: Record<string, string>; width?: number; height?: number; avg_frame_rate?: string; bit_rate?: string; pix_fmt?: string; color_transfer?: string; channels?: number }
 type ProbeResult = { format?: { format_name?: string; duration?: string; bit_rate?: string }; streams?: ProbeStream[] }
+
+export function validateAppleHevcOutput(result: ProbeResult, audioExpected: boolean): void {
+  const video = result.streams?.find((stream) => stream.codec_type === 'video')
+  const audio = result.streams?.find((stream) => stream.codec_type === 'audio')
+  if (!result.format?.format_name?.split(',').includes('mp4') || video?.codec_name !== 'hevc' || video.codec_tag_string !== 'hvc1' || video.profile !== 'Main' || video.pix_fmt !== 'yuv420p' ||
+    (audioExpected && !audio) || (audio && (audio.codec_name !== 'aac' || audio.profile !== 'LC' || audio.channels !== 2))) {
+    throw new Error('转码输出不符合 Apple HEVC 格式要求（MP4 / hvc1 / Main 8-bit / AAC-LC 双声道）')
+  }
+}
 
 function numeric(value: string | undefined): number | null {
   const number = Number(value)
@@ -20,6 +29,14 @@ function frameRate(value: string | undefined): number | null {
   const [numerator, denominator] = value.split('/').map(Number)
   const rate = denominator ? numerator / denominator : numerator
   return Number.isFinite(rate) && rate > 0 ? Math.round(rate * 100) / 100 : null
+}
+
+export function formatCutTimestamp(seconds: number): string {
+  const total = Math.max(0, Math.floor(seconds))
+  const hours = Math.floor(total / 3600)
+  const minutes = Math.floor((total % 3600) / 60)
+  const remainder = total % 60
+  return [hours, minutes, remainder].map((value) => String(value).padStart(2, '0')).join('-')
 }
 
 export function parseProbe(result: ProbeResult): MediaInfo {
@@ -126,9 +143,9 @@ export class FfmpegService {
     const outputPath = this.outputPath(inputPath, kind)
     const temporaryPath = join(dirname(outputPath), `.${basename(outputPath)}.${fileId}.tmp.mp4`)
     if (existsSync(outputPath)) throw new Error('目标转码版本已存在，不会覆盖已有文件')
-    const args = ['-y', '-i', inputPath, '-map', '0:v:0', '-map', '0:a:0?', '-map_metadata', '0', '-c:v', 'hevc_nvenc', '-preset', 'p5', '-tune', 'hq', '-rc:v', 'vbr', '-cq:v', '23', '-spatial_aq', '1', '-aq-strength', '8', '-rc-lookahead', '16', '-pix_fmt', 'yuv420p', '-tag:v', 'hvc1']
-    if (kind === 'hevc-720p') args.push('-vf', 'scale=-2:min(720\\,ih)')
-    args.push('-c:a', 'aac', '-b:a', '160k', '-ac', '2', '-movflags', '+faststart', '-progress', 'pipe:1', '-nostats', temporaryPath)
+    const args = ['-y', '-i', inputPath, '-map', '0:v:0', '-map', '0:a:0?', '-map_metadata', '0', '-c:v', 'hevc_nvenc', '-profile:v', 'main', '-tier:v', 'main', '-preset', 'p5', '-tune', 'hq', '-rc:v', 'vbr', '-cq:v', '28', '-spatial_aq', '1', '-aq-strength', '8', '-rc-lookahead', '16', '-pix_fmt', 'yuv420p', '-tag:v', 'hvc1']
+    if (kind === 'hevc-720p') args.push('-vf', "scale=-2:'min(720,ih)'")
+    args.push('-c:a', 'aac', '-profile:a', 'aac_low', '-ar', '48000', '-b:a', '160k', '-ac', '2', '-movflags', '+faststart', '-progress', 'pipe:1', '-nostats', temporaryPath)
     onCommand?.(`ffmpeg.exe ${args.map((arg) => /[\s"]/u.test(arg) ? `"${arg.replaceAll('"', '\\"')}"` : arg).join(' ')}`)
     await rm(temporaryPath, { force: true })
     let duration = sourceInfo?.durationSeconds ?? null
@@ -156,6 +173,8 @@ export class FfmpegService {
       })
       const mediaInfo = await this.analyze(temporaryPath)
       if (!mediaInfo?.videoCodec || !mediaInfo.durationSeconds || (duration && Math.abs(mediaInfo.durationSeconds - duration) > Math.max(10, duration * 0.1))) throw new Error('转码文件校验失败')
+      const { stdout } = await execFileAsync('ffprobe.exe', ['-v', 'error', '-show_entries', 'format=format_name:stream=codec_type,codec_name,codec_tag_string,profile,pix_fmt,channels', '-of', 'json', temporaryPath], { windowsHide: true })
+      validateAppleHevcOutput(JSON.parse(stdout) as ProbeResult, Boolean(sourceInfo?.audioCodec))
       await rename(temporaryPath, outputPath)
       onProgress({ state: 'completed', percent: 100, speed: null, etaSeconds: 0, outputPath })
       return { outputPath, mediaInfo }
@@ -201,6 +220,45 @@ export class FfmpegService {
       return { outputPath }
     } catch (error) { await rm(temporaryPath, { force: true }).catch(() => undefined); throw error }
     finally { this.active = null }
+  }
+
+  cutOutputPath(inputPath: string, startSeconds: number, endSeconds: number): string {
+    const stem = basename(inputPath, extname(inputPath)).replace(/\s*\[剪切[^\]]*\]\s*/gi, ' ').trim()
+    const suffix = `[剪切 ${formatCutTimestamp(startSeconds)} 至 ${formatCutTimestamp(endSeconds)}]`
+    let attempt = 1
+    let outputPath = join(dirname(inputPath), `${stem} ${suffix}.mp4`)
+    while (existsSync(outputPath)) {
+      attempt += 1
+      outputPath = join(dirname(inputPath), `${stem} ${suffix} (${attempt}).mp4`)
+    }
+    return outputPath
+  }
+
+  async cut(inputPath: string, startSeconds: number, endSeconds: number, mode: 'copy' | 'transcode', options: ToolEncodeOptions | null, onProgress: (progress: Pick<ToolTask, 'state' | 'percent' | 'speed' | 'etaSeconds'>) => void, onCommand?: (command: string) => void): Promise<{ outputPath: string }> {
+    if (!this.status.available) throw new Error(this.status.message ?? 'FFmpeg 不可用')
+    if (mode === 'transcode' && !this.status.nvencAvailable) throw new Error(this.status.message ?? 'NVIDIA 编码器不可用')
+    if (this.active) throw new Error('已有 FFmpeg 任务正在运行')
+    const sourceInfo = await this.analyze(inputPath)
+    const sourceDuration = sourceInfo?.durationSeconds
+    if (!sourceDuration || !Number.isFinite(startSeconds) || !Number.isFinite(endSeconds) || startSeconds < 0 || endSeconds <= startSeconds || endSeconds > sourceDuration + 0.01) throw new Error('剪切时间范围无效')
+    const duration = endSeconds - startSeconds
+    const outputPath = this.cutOutputPath(inputPath, startSeconds, endSeconds)
+    const temporaryPath = join(dirname(outputPath), `.${basename(outputPath)}.${Date.now()}.tmp.mp4`)
+    const time = (value: number) => value.toFixed(3)
+    const args = mode === 'copy'
+      ? ['-y', '-ss', time(startSeconds), '-i', inputPath, '-t', time(duration), '-map', '0:v:0', '-map', '0:a:0?', '-c', 'copy', '-avoid_negative_ts', 'make_zero', '-movflags', '+faststart', '-progress', 'pipe:1', '-nostats', temporaryPath]
+      : ['-y', '-i', inputPath, '-ss', time(startSeconds), '-t', time(duration), '-map', '0:v:0', '-map', '0:a:0?', ...this.encodeArgs(options!), '-c:a', 'aac', '-b:a', '160k', '-ac', '2', '-movflags', '+faststart', '-progress', 'pipe:1', '-nostats', temporaryPath]
+    onCommand?.(`ffmpeg.exe ${args.map((arg) => /[\s"]/u.test(arg) ? `"${arg.replaceAll('"', '\\"')}"` : arg).join(' ')}`)
+    try {
+      await this.run(args, duration, onProgress)
+      const info = await this.analyze(temporaryPath)
+      if (!info?.videoCodec || !info.durationSeconds) throw new Error('剪切文件校验失败')
+      await rename(temporaryPath, outputPath)
+      return { outputPath }
+    } catch (error) {
+      await rm(temporaryPath, { force: true }).catch(() => undefined)
+      throw error
+    } finally { this.active = null }
   }
 
   private async run(args: string[], duration: number | null, onProgress: (progress: Pick<ToolTask, 'state' | 'percent' | 'speed' | 'etaSeconds'>) => void): Promise<void> {

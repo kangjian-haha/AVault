@@ -45,6 +45,9 @@ import type {
   AiUsageStats,
   AppLogEntry,
   AppSnapshot,
+  BackupProgress,
+  BackupRestoreReport,
+  BackupState,
   LibraryRecord,
   MetadataBatchProgress,
   MetadataCandidate,
@@ -127,8 +130,8 @@ type LibraryWorkspaceState = {
 type SettingsWorkspaceState = { fc2CookieDraft: string | null; fc2CookieExpanded: boolean };
 
 const emptyToolboxSession = (): ToolboxSession => ({
-  tab: "merge", mergeFiles: [], transcodeFiles: [], probeFiles: [], probePath: null,
-  outputName: "合并影片", codec: "hevc", height: "keep", frameRate: "keep", cq: "23", maxBitrate: "",
+  tab: "merge", mergeFiles: [], transcodeFiles: [], cutFile: null, probeFiles: [], probePath: null,
+  outputName: "合并影片", cutStart: "00:00:00", cutEnd: "00:00:00", cutMode: "copy", codec: "hevc", height: "keep", frameRate: "keep", cq: "23", maxBitrate: "",
 });
 
 function errorMessage(error: unknown): string {
@@ -483,6 +486,7 @@ function MovieDetailPage({
     if (!coverPreviewOpen && !previewViewerOpen) return;
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
+        event.preventDefault();
         setCoverPreviewOpen(false);
         setPreviewViewerOpen(false);
         setPreviewZoom(1);
@@ -900,7 +904,7 @@ function MovieDetailPage({
   );
 
   return (
-    <div className="relative isolate min-h-full w-full overflow-hidden">
+    <div className="relative isolate min-h-full w-full overflow-x-clip">
       {movie.coverUrl && (
         <div
           className="pointer-events-none absolute inset-0 z-0 overflow-hidden"
@@ -1574,6 +1578,17 @@ function ActorMoviesPage({
     "release-desc" | "release-asc" | "added-desc" | "code-asc"
   >("release-desc");
   const avatarInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (!avatarPreviewOpen) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      setAvatarPreviewOpen(false);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [avatarPreviewOpen]);
 
   const filteredMovies = useMemo(() => {
     const needle = movieSearch.trim().toLocaleLowerCase();
@@ -2852,7 +2867,7 @@ function AiCenterPage({
             <p className="mt-1 text-sm leading-6 text-zinc-500">
               模型使用{" "}
               <span className="font-mono text-zinc-400">deepseek-v4-flash</span>
-              。获取资料时会先搜索公开网页，再由模型整理；无法确认的字段保持为空。
+              。获取资料时会优先查询日文 Wikipedia 与 Wikidata，再搜索公开网页补充社交链接；无法确认的字段保持为空。
             </p>
             <Input
               type="password"
@@ -2954,6 +2969,52 @@ function SettingsPage({
     }
   }
   const [savingFc2Cookie, setSavingFc2Cookie] = useState(false);
+  const [backupState, setBackupState] = useState<BackupState | null>(null);
+  const [backupProgress, setBackupProgress] = useState<BackupProgress | null>(null);
+  const [restoreReport, setRestoreReport] = useState<BackupRestoreReport | null>(null);
+  const [backupBusy, setBackupBusy] = useState(false);
+  const refreshBackups = useCallback(async () => setBackupState(await window.avault.getBackupState()), []);
+  useEffect(() => {
+    void refreshBackups().catch((error) => notify(errorMessage(error), true));
+    const unsubscribe = window.avault.onBackupProgress((progress) => {
+      setBackupProgress(progress);
+      if (progress.phase === "complete" || progress.phase === "cancelled" || progress.phase === "error") {
+        setBackupBusy(false);
+        void refreshBackups();
+      }
+    });
+    void window.avault.getLastRestoreReport().then((report) => {
+      if (!report) return;
+      setRestoreReport(report);
+      notify(`数据已恢复：旁路资料 ${report.restoredCompanionFiles} 个${report.skippedCompanionFiles ? `，跳过 ${report.skippedCompanionFiles} 个` : ""}`);
+    });
+    return unsubscribe;
+  }, [notify, refreshBackups]);
+  async function createBackup() {
+    setBackupBusy(true);
+    try {
+      await window.avault.createBackup();
+      await refreshBackups();
+      notify("数据备份已完成");
+    } catch (error) {
+      notify(errorMessage(error), true);
+    } finally {
+      setBackupBusy(false);
+    }
+  }
+  async function chooseBackupDirectory() {
+    try {
+      const path = await window.avault.chooseBackupDirectory();
+      if (path) { await refreshBackups(); notify("备份目录已保存"); }
+    } catch (error) { notify(errorMessage(error), true); }
+  }
+  async function restoreBackup(directory: string) {
+    const record = backupState?.records.find((item) => item.directory === directory);
+    if (!record || record.status !== "completed") return;
+    const confirmed = confirm(`恢复“${record.id}”？\n\n恢复前会自动创建当前数据的安全快照。此备份包含已配对设备、Cookie 和 API Key；恢复完成后 AVault 将自动重启。`);
+    if (!confirmed) return;
+    try { await window.avault.restoreBackup(directory); } catch (error) { notify(errorMessage(error), true); }
+  }
   const fc2Cookie = workspace.fc2CookieDraft ?? snapshot.settings.fc2Cookie;
   const fc2CookieExpanded = workspace.fc2CookieExpanded;
   async function saveFc2Cookie() {
@@ -3028,6 +3089,32 @@ function SettingsPage({
                     {snapshot.settings.ffmpeg.version}
                   </div>
                 )}
+              </div>
+            </div>
+          </div>
+        </section>
+        <section className="rounded-2xl border border-white/8 bg-white/[0.025] p-5 lg:col-span-2">
+          <div className="flex items-start gap-4">
+            <div className="rounded-xl bg-sky-500/10 p-3"><Archive className="size-5 text-sky-300" /></div>
+            <div className="min-w-0 flex-1">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <h2 className="font-semibold">数据备份与恢复</h2>
+                  <p className="mt-1 text-sm leading-6 text-zinc-500">备份数据库、演员头像和应用设置；不会复制影片目录内的封面、预览图或本地 JSON，也不复制视频和转码文件。备份包含配对、Cookie 与 API Key，请妥善保管。</p>
+                </div>
+                <div className="flex gap-2">
+                  <Button size="sm" variant="outline" onClick={() => void window.avault.revealBackupDirectory()} disabled={backupBusy}><FolderOpen className="size-4" />打开目录</Button>
+                  <Button size="sm" variant="secondary" onClick={chooseBackupDirectory} disabled={backupBusy}>选择目录</Button>
+                  <Button size="sm" onClick={createBackup} disabled={backupBusy}>{backupBusy && <LoaderCircle className="size-4 animate-spin" />}{backupBusy ? "正在备份" : "立即备份"}</Button>
+                </div>
+              </div>
+              <div className="mt-4 flex flex-wrap items-center gap-2 rounded-lg bg-black/20 px-3 py-2 text-xs text-zinc-500">
+                <HardDrive className="size-3.5 text-zinc-400" /><span className="max-w-full truncate">{backupState?.directory ?? "正在读取备份目录…"}</span><span className="text-zinc-700">·</span><span>保留最近 5 份完整备份</span>
+              </div>
+              {backupProgress && backupBusy && <div className="mt-3 rounded-lg border border-sky-400/15 bg-sky-400/[0.05] px-3 py-2 text-xs text-sky-100"><div className="flex items-center justify-between gap-3"><span>{backupProgress.message}</span><span className="text-sky-300">{backupProgress.copiedFiles} 个文件 · {formatBytes(backupProgress.copiedBytes)}</span></div><div className="mt-2 h-1 overflow-hidden rounded bg-white/10"><div className="h-full w-2/3 animate-pulse rounded bg-sky-400" /></div>{backupProgress.cancellable && <Button size="sm" variant="ghost" className="mt-2 h-7 px-2 text-xs" onClick={() => void window.avault.cancelBackup()}>取消备份</Button>}</div>}
+              <div className="mt-4 space-y-2">
+                {restoreReport && <div className="rounded-xl border border-emerald-400/20 bg-emerald-400/[0.06] px-3 py-3 text-xs text-emerald-100"><div className="flex items-start justify-between gap-3"><div><b>上次恢复完成</b><p className="mt-1 leading-5 text-emerald-200/75">数据库、演员头像和应用设置已恢复。影片目录内容未被修改。恢复前安全快照：{restoreReport.safetySnapshotDirectory ?? "未记录"}</p></div><Button size="sm" variant="ghost" className="h-7 px-2 text-xs" onClick={() => { setRestoreReport(null); void window.avault.clearLastRestoreReport(); }}>关闭</Button></div></div>}
+                {backupState?.records.length ? backupState.records.map((record) => <div key={record.directory} className="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-xl border border-white/[0.06] bg-black/15 px-3 py-2.5 text-xs"><Archive className={cn("size-4", record.status === "completed" ? "text-sky-300" : "text-amber-300")} /><div className="min-w-[180px] flex-1"><div className="font-medium text-zinc-200">{record.id}{record.isSafetySnapshot && <span className="ml-2 text-[10px] text-amber-300">恢复前安全快照</span>}</div><div className="mt-0.5 text-zinc-600">{record.status === "completed" ? `${formatDate(record.createdAt)} · ${formatBytes(record.size)} · ${record.libraryCount} 个媒体目录` : record.status === "incomplete" ? "未完成备份，不能恢复" : "备份无效或已损坏"}</div></div>{record.status === "completed" && <Button size="sm" variant="outline" onClick={() => void restoreBackup(record.directory)} disabled={backupBusy}>恢复此备份</Button>}</div>) : <div className="rounded-xl border border-dashed border-white/10 px-3 py-5 text-center text-xs text-zinc-600">尚无备份。建议在大量整理、批量爬取或升级前创建一份。</div>}
               </div>
             </div>
           </div>
@@ -3398,7 +3485,7 @@ export function App() {
     });
     const tools = toolTasks.map((task) => ({
       id: `tool:${task.id}`, source: "工具箱" as const, name: task.outputName,
-      detail: task.type === "merge-copy" ? "无损合并" : task.type === "merge-transcode" ? "转码合并" : "独立转码",
+      detail: task.type === "merge-copy" ? "无损合并" : task.type === "merge-transcode" ? "转码合并" : task.type === "cut-copy" ? "快速无损剪切" : task.type === "cut-transcode" ? "精确剪切" : "独立转码",
       state: task.state, percent: task.percent, speed: task.speed, etaSeconds: task.etaSeconds,
       outputPath: task.outputPath, message: task.message, createdAt: task.createdAt, queueOrder: task.queueOrder,
       cancel: () => window.avault.cancelToolTask(task.id), remove: async () => {
@@ -3580,6 +3667,42 @@ export function App() {
     if (sourceMovieId) setSelectedId(sourceMovieId);
     scrollMainTo(0);
   }
+
+  useEffect(() => {
+    const handleEscapeBack = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || event.defaultPrevented || event.repeat)
+        return;
+
+      // 覆盖层优先处理 Escape，避免关闭图片预览或编辑弹窗时又意外离开详情页。
+      if (moreMenuOpen) {
+        event.preventDefault();
+        setMoreMenuOpen(false);
+        return;
+      }
+      if (taskDrawerOpen) {
+        event.preventDefault();
+        setTaskDrawerOpen(false);
+        return;
+      }
+      if (document.querySelector('[role="dialog"]')) return;
+
+      if (selectedId) {
+        event.preventDefault();
+        backToLibrary();
+      } else if (actorPage) {
+        event.preventDefault();
+        closeActorPage();
+      } else if (tagPage) {
+        event.preventDefault();
+        closeTagPage();
+      } else if (canGoBack) {
+        event.preventDefault();
+        goBack();
+      }
+    };
+    window.addEventListener("keydown", handleEscapeBack);
+    return () => window.removeEventListener("keydown", handleEscapeBack);
+  }, [actorPage, canGoBack, moreMenuOpen, selectedId, tagPage, taskDrawerOpen]);
 
   function openTagMovie(id: string) {
     tagScrollRef.current = mainRef.current?.scrollTop ?? 0;

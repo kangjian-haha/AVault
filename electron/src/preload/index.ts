@@ -44,6 +44,14 @@ const api: DesktopApi = {
   getAiUsageStats: () => ipcRenderer.invoke('ai:usage-stats'),
   getLogs: (scope) => ipcRenderer.invoke('logs:list', scope),
   clearLogs: (scope) => ipcRenderer.invoke('logs:clear', scope),
+  getBackupState: () => ipcRenderer.invoke('backup:state'),
+  chooseBackupDirectory: () => ipcRenderer.invoke('backup:choose-directory'),
+  createBackup: () => ipcRenderer.invoke('backup:create'),
+  cancelBackup: () => ipcRenderer.invoke('backup:cancel'),
+  revealBackupDirectory: () => ipcRenderer.invoke('backup:reveal-directory'),
+  restoreBackup: (directory) => ipcRenderer.invoke('backup:restore', directory),
+  getLastRestoreReport: () => ipcRenderer.invoke('backup:last-restore-report'),
+  clearLastRestoreReport: () => ipcRenderer.invoke('backup:clear-last-restore-report'),
   startTranscode: (fileId, kind) => ipcRenderer.invoke('transcode:start', fileId, kind),
   cancelTranscode: (fileId, kind) => ipcRenderer.invoke('transcode:cancel', fileId, kind),
   getTranscodeTasks: () => ipcRenderer.invoke('transcode:list'),
@@ -53,6 +61,7 @@ const api: DesktopApi = {
   inspectToolFiles: (paths) => ipcRenderer.invoke('tool:inspect-files', paths),
   startToolMerge: (paths, outputName, mode, options) => ipcRenderer.invoke('tool:start-merge', paths, outputName, mode, options),
   startToolTranscode: (paths, options) => ipcRenderer.invoke('tool:start-transcode', paths, options),
+  startToolCut: (path, startSeconds, endSeconds, mode, options) => ipcRenderer.invoke('tool:start-cut', path, startSeconds, endSeconds, mode, options),
   getToolTasks: () => ipcRenderer.invoke('tool:list-tasks'),
   cancelToolTask: (taskId) => ipcRenderer.invoke('tool:cancel-task', taskId),
   removeToolTask: (taskId) => ipcRenderer.invoke('tool:remove-task', taskId),
@@ -85,6 +94,11 @@ const api: DesktopApi = {
     const handler = (_event: Electron.IpcRendererEvent, task: import('../shared/contracts').ToolTask) => listener(task)
     ipcRenderer.on('tool:task-progress', handler)
     return () => ipcRenderer.removeListener('tool:task-progress', handler)
+  }
+  , onBackupProgress: (listener) => {
+    const handler = (_event: Electron.IpcRendererEvent, progress: import('../shared/contracts').BackupProgress) => listener(progress)
+    ipcRenderer.on('backup:progress', handler)
+    return () => ipcRenderer.removeListener('backup:progress', handler)
   }
 }
 

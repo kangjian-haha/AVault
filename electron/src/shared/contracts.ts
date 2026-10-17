@@ -85,10 +85,12 @@ export interface ToolFile {
 }
 export interface ToolTask {
   id: string
-  type: 'merge-copy' | 'merge-transcode' | 'transcode'
+  type: 'merge-copy' | 'merge-transcode' | 'transcode' | 'cut-copy' | 'cut-transcode'
   inputPaths: string[]
   outputName: string
   options: ToolEncodeOptions | null
+  cutStartSeconds?: number
+  cutEndSeconds?: number
   state: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
   percent: number | null
   speed: string | null
@@ -329,6 +331,60 @@ export interface LocalJsonExportResult {
   errors: string[]
 }
 
+export interface BackupManifestAsset {
+  relativePath: string
+  size: number
+  sha256: string
+}
+
+export interface BackupManifest {
+  formatVersion: number
+  kind: 'avault-backup'
+  createdAt: string
+  completedAt: string
+  appVersion: string
+  isSafetySnapshot: boolean
+  database: { path: string; size: number; sha256: string }
+  libraries: Array<{ id: string; name: string; rootPath: string; archiveName: string; availableAtBackup: boolean; assets: BackupManifestAsset[] }>
+}
+
+export interface BackupRecord {
+  id: string
+  directory: string
+  status: 'completed' | 'incomplete' | 'invalid'
+  createdAt: string | null
+  completedAt: string | null
+  size: number
+  appVersion: string | null
+  libraryCount: number
+  companionFileCount: number
+  isSafetySnapshot: boolean
+}
+
+export interface BackupProgress {
+  phase: 'database' | 'assets' | 'companions' | 'verifying' | 'restoring' | 'complete' | 'cancelled' | 'error'
+  message: string
+  copiedFiles: number
+  copiedBytes: number
+  totalFiles: number | null
+  cancellable: boolean
+}
+
+export interface BackupRestoreReport {
+  backupId: string
+  restoredAt: string
+  safetySnapshotDirectory: string | null
+  restoredCompanionFiles: number
+  skippedCompanionFiles: number
+  missingLibraryRoots: string[]
+  skippedReasons: string[]
+}
+
+export interface BackupState {
+  directory: string
+  records: BackupRecord[]
+}
+
 export interface DesktopApi {
   getSnapshot: () => Promise<AppSnapshot>
   addLibrary: () => Promise<LibraryRecord | null>
@@ -351,6 +407,15 @@ export interface DesktopApi {
   applyMetadata: (movieId: string, providerId: string, mode: 'fill' | 'preserve' | 'overwrite') => Promise<MovieRecord>
   batchFetchMetadata: (libraryId: string) => Promise<MetadataBatchProgress>
   exportLocalJson: (libraryId: string) => Promise<LocalJsonExportResult>
+  getBackupState: () => Promise<BackupState>
+  chooseBackupDirectory: () => Promise<string | null>
+  createBackup: () => Promise<BackupRecord>
+  cancelBackup: () => Promise<void>
+  revealBackupDirectory: () => Promise<void>
+  restoreBackup: (directory: string) => Promise<void>
+  getLastRestoreReport: () => Promise<BackupRestoreReport | null>
+  clearLastRestoreReport: () => Promise<void>
+  onBackupProgress: (listener: (progress: BackupProgress) => void) => () => void
   getActorProfile: (name: string) => Promise<ActorProfile | null>
   fetchActorAvatar: (name: string) => Promise<ActorProfile>
   lookupActorProfile: (name: string) => Promise<ActorProfile>
@@ -382,6 +447,7 @@ export interface DesktopApi {
   inspectToolFiles: (paths: string[]) => Promise<ToolFile[]>
   startToolMerge: (paths: string[], outputName: string, mode: 'copy' | 'transcode', options: ToolEncodeOptions) => Promise<void>
   startToolTranscode: (paths: string[], options: ToolEncodeOptions) => Promise<void>
+  startToolCut: (path: string, startSeconds: number, endSeconds: number, mode: 'copy' | 'transcode', options: ToolEncodeOptions | null) => Promise<void>
   getToolTasks: () => Promise<ToolTask[]>
   cancelToolTask: (taskId: string) => Promise<void>
   removeToolTask: (taskId: string) => Promise<void>

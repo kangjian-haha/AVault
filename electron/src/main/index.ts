@@ -24,13 +24,14 @@ import { Fc2Provider, fc2ArticleId } from './fc2'
 import { GfriendsActorProvider } from './gfriends'
 import { DeepSeekActorProvider } from './deepseek'
 import { parseJavDbHtml } from './javdb-html'
-import { searchActorPublicSources } from './actor-web-search'
+import { applyWikipediaActorFacts, searchActorPublicSources } from './actor-web-search'
 import { PotPlayerService } from './potplayer'
 import { LanServer } from './lan-server'
 import { FfmpegService } from './ffmpeg'
 import { MediaOrganizer, createOrganizePreview } from './organizer'
 import { sidecarPathForMediaFile, writeMovieSidecar } from './sidecar'
 import { pickNextFfmpegSource } from './ffmpeg-task-queue'
+import { BackupService } from './backup-service'
 import type { ActorProfilePatch, HomePreferences, MetadataBatchProgress, MetadataDetails, MoviePatch, MovieRecord, ScanProgress, SourcePartition, ToolEncodeOptions, ToolFile, ToolTask, TranscodeKind, TranscodeProgress } from '../shared/contracts'
 
 protocol.registerSchemesAsPrivileged([
@@ -53,10 +54,12 @@ let mainWindow: BrowserWindow | null = null
 let tray: Tray | null = null
 let quitting = false
 let database: AppDatabase
+let databaseClosed = false
 let scanner: MediaScanner
 let potPlayer: PotPlayerService
 let lanServer: LanServer
 let ffmpeg: FfmpegService
+let backupService: BackupService
 let metadataBatchRunning = false
 const metadataLookupSessions = new Map<string, { provider: JavBusProvider | Fc2Provider; expiresAt: number }>()
 let syncedFc2Cookie = ''
@@ -403,10 +406,12 @@ async function runToolTask(task: ToolTask): Promise<void> {
     const result = await enqueueFfmpeg(async () => {
       if (!toolTasks.includes(task) || task.state !== 'queued') throw new Error('任务已取消')
       activeQueuedTask = { source: 'tool', id: task.id }
-      Object.assign(task, { state: 'running', percent: 0, message: task.type === 'merge-copy' ? '正在无损合并' : task.type === 'merge-transcode' ? '正在转码合并' : '正在转码' }); publishToolTask(task)
+      Object.assign(task, { state: 'running', percent: 0, message: task.type === 'merge-copy' ? '正在无损合并' : task.type === 'merge-transcode' ? '正在转码合并' : task.type === 'cut-copy' ? '正在快速无损剪切' : task.type === 'cut-transcode' ? '正在精确剪切' : '正在转码' }); publishToolTask(task)
       try {
         return await (task.type === 'transcode'
           ? ffmpeg.toolTranscode(task.inputPaths[0], task.options!, (progress) => { Object.assign(task, progress); publishToolTask(task) }, (command) => database.addLog('ffmpeg', 'info', `工具箱转码：${task.outputName}`, command))
+          : task.type === 'cut-copy' || task.type === 'cut-transcode'
+            ? ffmpeg.cut(task.inputPaths[0], task.cutStartSeconds!, task.cutEndSeconds!, task.type === 'cut-copy' ? 'copy' : 'transcode', task.options, (progress) => { Object.assign(task, progress); publishToolTask(task) }, (command) => database.addLog('ffmpeg', 'info', `工具箱剪切：${task.outputName}`, command))
           : ffmpeg.merge(task.inputPaths, task.outputName, task.type === 'merge-copy' ? 'copy' : 'transcode', task.options!, (progress) => { Object.assign(task, progress); publishToolTask(task) }, (command) => database.addLog('ffmpeg', 'info', `工具箱合并：${task.outputName}`, command)))
       } finally { activeQueuedTask = null }
     })
@@ -462,6 +467,34 @@ function registerIpc(): void {
   ipcMain.handle('ai:usage-stats', () => database.getAiUsageStats())
   ipcMain.handle('logs:list', (_event, scope?: 'ai' | 'ffmpeg') => database.listLogs(scope))
   ipcMain.handle('logs:clear', (_event, scope?: 'ai' | 'ffmpeg') => database.clearLogs(scope))
+  ipcMain.handle('backup:state', async () => ({ directory: backupService.getDirectory(), records: await backupService.list() }))
+  ipcMain.handle('backup:choose-directory', async () => {
+    const result = await dialog.showOpenDialog(mainWindow!, { title: '选择 AVault 备份目录', defaultPath: backupService.getDirectory(), properties: ['openDirectory', 'createDirectory'] })
+    return result.canceled || !result.filePaths[0] ? null : backupService.setDirectory(result.filePaths[0])
+  })
+  ipcMain.handle('backup:create', () => backupService.createBackup())
+  ipcMain.handle('backup:cancel', () => backupService.cancel())
+  ipcMain.handle('backup:reveal-directory', async () => {
+    const directory = backupService.getDirectory()
+    await mkdir(directory, { recursive: true })
+    shell.openPath(directory)
+  })
+  ipcMain.handle('backup:restore', async (_event, directory: string) => {
+    if (typeof directory !== 'string' || !directory.trim()) throw new Error('备份目录无效')
+    const prepared = await backupService.prepareRestore(directory)
+    await lanServer.stop()
+    database.close()
+    databaseClosed = true
+    try {
+      await backupService.restorePrepared(prepared)
+    } catch (error) {
+      throw new Error(`恢复中断；当前数据的安全快照位于：${prepared.report.safetySnapshotDirectory ?? '未知位置'}。${error instanceof Error ? error.message : String(error)}`)
+    }
+    app.relaunch()
+    app.exit(0)
+  })
+  ipcMain.handle('backup:last-restore-report', () => backupService.getLastRestoreReport())
+  ipcMain.handle('backup:clear-last-restore-report', () => backupService.clearLastRestoreReport())
   ipcMain.handle('app:snapshot', () => ({
     libraries: database.listLibraries(),
     movies: database.listMovies(),
@@ -827,7 +860,7 @@ function registerIpc(): void {
       const result = await provider.getActorDetails(name, existing?.aliases ?? [], sources)
       database.recordAiUsage('deepseek-v4-flash', result.usage.promptTokens, result.usage.completionTokens, result.usage.totalTokens, true)
       database.addLog('ai', 'info', `AI 演员资料返回：${name}`, `联网来源：\n${sources.map((source) => `${source.title}\n${source.url}`).join('\n\n')}\n\n请求：\n${result.request}\n\n原始返回：\n${result.response}`)
-      return database.upsertActorProfile(result.details, null)
+      return database.upsertActorProfile(applyWikipediaActorFacts(result.details, sources), null)
     } catch (error) {
       database.recordAiUsage('deepseek-v4-flash', 0, 0, 0, false)
       database.addLog('ai', 'error', `AI 演员资料失败：${name}`, error instanceof Error ? error.stack ?? error.message : String(error))
@@ -931,6 +964,18 @@ function registerIpc(): void {
     }
     void processFfmpegQueue()
   })
+  ipcMain.handle('tool:start-cut', async (_event, path: string, startSeconds: number, endSeconds: number, mode: 'copy' | 'transcode', options: ToolEncodeOptions | null) => {
+    const [file] = await inspectToolFiles([path])
+    if (!file) throw new Error('请选择可访问的视频文件')
+    if (!Number.isFinite(startSeconds) || !Number.isFinite(endSeconds) || startSeconds < 0 || endSeconds <= startSeconds) throw new Error('剪切时间范围无效')
+    const duration = file.mediaInfo?.durationSeconds
+    if (!duration || endSeconds > duration + 0.01) throw new Error('结束时间超过视频时长')
+    if (!['copy', 'transcode'].includes(mode)) throw new Error('剪切模式无效')
+    const validOptions = mode === 'transcode' ? validToolOptions(options as ToolEncodeOptions) : null
+    const outputName = basename(ffmpeg.cutOutputPath(file.path, startSeconds, endSeconds))
+    const task: ToolTask = { id: randomUUID(), type: mode === 'copy' ? 'cut-copy' : 'cut-transcode', inputPaths: [file.path], outputName, options: validOptions, cutStartSeconds: startSeconds, cutEndSeconds: endSeconds, state: 'queued', percent: 0, speed: null, etaSeconds: null, createdAt: new Date().toISOString(), queueOrder: ++ffmpegTaskSequence }
+    toolTasks.push(task); publishToolTask(task); void processFfmpegQueue()
+  })
   ipcMain.handle('tool:list-tasks', () => toolTasks.map((task) => ({ ...task })))
   ipcMain.handle('tool:cancel-task', (_event, id: string) => {
     const task = toolTasks.find((item) => item.id === id)
@@ -960,6 +1005,7 @@ function registerIpc(): void {
 async function bootstrap(): Promise<void> {
   Menu.setApplicationMenu(null)
   database = new AppDatabase(join(app.getPath('userData'), 'avault.sqlite'))
+  backupService = new BackupService(database, app.getPath('userData'), app.getVersion(), (progress) => mainWindow?.webContents.send('backup:progress', progress))
   const legacyDataDirectory = join(app.getPath('appData'), 'avault-desktop')
   const repairedAssetPaths = database.relocateLocalAssetPaths(legacyDataDirectory, app.getPath('userData'))
   if (repairedAssetPaths > 0) console.info(`已更新 ${repairedAssetPaths} 个本地封面或演员头像路径`)
@@ -1021,7 +1067,7 @@ else {
 app.on('before-quit', () => { quitting = true })
 app.on('will-quit', () => {
   void lanServer?.stop()
-  database?.close()
+  if (!databaseClosed) database?.close()
 })
 app.on('window-all-closed', () => {
   // Windows keeps the process alive in the tray until the user chooses “完全退出”.

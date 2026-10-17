@@ -1,4 +1,4 @@
-import { ArrowDown, ArrowUp, CircleHelp, FileVideo2, Plus, X } from 'lucide-react'
+import { ArrowDown, ArrowUp, CircleHelp, FileVideo2, Plus, Scissors, X } from 'lucide-react'
 import type { Dispatch, SetStateAction } from 'react'
 import { useMemo } from 'react'
 import type { AppSnapshot, ToolEncodeOptions, ToolFile } from '../../shared/contracts'
@@ -7,15 +7,20 @@ import { Button } from './components/ui/button'
 import { Input } from './components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './components/ui/select'
 import { cn, formatBytes } from './lib/utils'
+import { formatCutTime, parseCutTime } from './tool-cut-time'
 
-export type ToolboxTab = 'merge' | 'transcode' | 'probe'
+export type ToolboxTab = 'merge' | 'transcode' | 'cut' | 'probe'
 export interface ToolboxSession {
   tab: ToolboxTab
   mergeFiles: ToolFile[]
   transcodeFiles: ToolFile[]
+  cutFile: ToolFile | null
   probeFiles: ToolFile[]
   probePath: string | null
   outputName: string
+  cutStart: string
+  cutEnd: string
+  cutMode: 'copy' | 'transcode'
   codec: ToolEncodeOptions['codec']
   height: string
   frameRate: string
@@ -23,65 +28,42 @@ export interface ToolboxSession {
   maxBitrate: string
 }
 
-export function IndependentToolsPage({ snapshot, notify, session, setSession }: {
-  snapshot: AppSnapshot
-  notify: (message: string, error?: boolean) => void
-  session: ToolboxSession
-  setSession: Dispatch<SetStateAction<ToolboxSession>>
-}) {
-  const { tab, mergeFiles, transcodeFiles, probeFiles, probePath, outputName, codec, height, frameRate, cq, maxBitrate } = session
-  const files = tab === 'merge' ? mergeFiles : tab === 'transcode' ? transcodeFiles : probeFiles
+function ToolEncodeFields({ session, update }: { session: ToolboxSession; update: (patch: Partial<ToolboxSession>) => void }) {
+  return <>
+    <div className="tool-form-grid">
+      <label>编码<Select value={session.codec} onValueChange={(value) => update({ codec: value as ToolEncodeOptions['codec'] })}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectItem value="hevc">H.265 / HEVC</SelectItem><SelectItem value="h264">H.264</SelectItem></SelectContent></Select></label>
+      <label>分辨率<Select value={session.height} onValueChange={(value) => update({ height: value })}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectItem value="keep">保持原分辨率</SelectItem><SelectItem value="720">最高 720p</SelectItem><SelectItem value="1080">最高 1080p</SelectItem></SelectContent></Select></label>
+      <label>帧率<Select value={session.frameRate} onValueChange={(value) => update({ frameRate: value })}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectItem value="keep">保持原帧率</SelectItem><SelectItem value="24000/1001">23.976 fps</SelectItem><SelectItem value="24">24 fps</SelectItem><SelectItem value="25">25 fps</SelectItem><SelectItem value="30000/1001">29.97 fps</SelectItem><SelectItem value="30">30 fps</SelectItem><SelectItem value="50">50 fps</SelectItem><SelectItem value="60000/1001">59.94 fps</SelectItem><SelectItem value="60">60 fps</SelectItem></SelectContent></Select></label>
+      <label><span className="tool-label-with-help">质量 CQ <span className="tool-help" data-tooltip="CQ 数值越小，画质越高、文件越大；数值越大，画质越低、文件越小。HEVC 一般推荐 23。"><CircleHelp /></span></span><Input value={session.cq} onChange={(event) => update({ cq: event.target.value })} inputMode="numeric" /></label>
+      <label className="span-2">最高码率（可选）<Input value={session.maxBitrate} onChange={(event) => update({ maxBitrate: event.target.value })} placeholder="留空则不限制峰值" inputMode="numeric" /></label>
+    </div>
+    <p className="tool-form-note">填写最高码率可限制手机播放时的带宽峰值；留空时由 NVENC 按 CQ 自动分配码率。</p>
+  </>
+}
+
+export function IndependentToolsPage({ snapshot, notify, session, setSession }: { snapshot: AppSnapshot; notify: (message: string, error?: boolean) => void; session: ToolboxSession; setSession: Dispatch<SetStateAction<ToolboxSession>> }) {
+  const { tab, mergeFiles, transcodeFiles, cutFile, probeFiles, probePath, outputName, cutStart, cutEnd, cutMode } = session
+  const files = tab === 'merge' ? mergeFiles : tab === 'transcode' ? transcodeFiles : tab === 'cut' ? (cutFile ? [cutFile] : []) : probeFiles
   const update = (patch: Partial<ToolboxSession>) => setSession((current) => ({ ...current, ...patch }))
-  const setFiles = (targetTab: ToolboxTab, updateFiles: SetStateAction<ToolFile[]>) => setSession((current) => {
-    const currentFiles = targetTab === 'merge' ? current.mergeFiles : targetTab === 'transcode' ? current.transcodeFiles : current.probeFiles
-    const nextFiles = typeof updateFiles === 'function' ? updateFiles(currentFiles) : updateFiles
-    if (targetTab === 'merge') return { ...current, mergeFiles: nextFiles }
-    if (targetTab === 'transcode') return { ...current, transcodeFiles: nextFiles }
-    return { ...current, probeFiles: nextFiles, probePath: nextFiles.some((file) => file.path === current.probePath) ? current.probePath : nextFiles[0]?.path ?? null }
+  const encodeOptions = (): ToolEncodeOptions => ({ codec: session.codec, height: session.height === 'keep' ? null : Number(session.height), frameRate: session.frameRate === 'keep' ? null : session.frameRate, cq: Number(session.cq), maxBitrateKbps: session.maxBitrate.trim() ? Number(session.maxBitrate) : null })
+  const addFiles = (targetTab: ToolboxTab, items: ToolFile[]) => setSession((current) => {
+    if (targetTab === 'cut') return { ...current, cutFile: items[0] ?? current.cutFile }
+    if (targetTab === 'merge') return { ...current, mergeFiles: [...current.mergeFiles, ...items.filter((item) => !current.mergeFiles.some((known) => known.path === item.path))] }
+    if (targetTab === 'transcode') return { ...current, transcodeFiles: [...current.transcodeFiles, ...items.filter((item) => !current.transcodeFiles.some((known) => known.path === item.path))] }
+    const next = [...current.probeFiles, ...items.filter((item) => !current.probeFiles.some((known) => known.path === item.path))]
+    return { ...current, probeFiles: next, probePath: current.probePath ?? next[0]?.path ?? null }
   })
-  const encodeOptions = (): ToolEncodeOptions => ({ codec, height: height === 'keep' ? null : Number(height), frameRate: frameRate === 'keep' ? null : frameRate, cq: Number(cq), maxBitrateKbps: maxBitrate.trim() ? Number(maxBitrate) : null })
-  const append = (targetTab: ToolboxTab, items: ToolFile[]) => setFiles(targetTab, (current) => {
-    const next = [...current, ...items.filter((item) => !current.some((known) => known.path === item.path))]
-    return next
-  })
-  const choose = async () => {
-    const targetTab = tab
-    append(targetTab, await window.avault.chooseToolFiles())
-  }
-  const drop = async (event: React.DragEvent) => {
-    event.preventDefault()
-    const targetTab = tab
-    append(targetTab, await window.avault.inspectToolFiles(Array.from(event.dataTransfer.files).map((file) => window.avault.getDroppedFilePath(file))))
-  }
-  const reorder = (index: number, offset: -1 | 1) => setSession((current) => {
-    const target = index + offset
-    if (target < 0 || target >= current.mergeFiles.length) return current
-    const next = [...current.mergeFiles]; [next[index], next[target]] = [next[target], next[index]]
-    return { ...current, mergeFiles: next }
-  })
-  const compatible = mergeFiles.length < 2 || mergeFiles.every((file) => {
-    const first = mergeFiles[0].mediaInfo; const current = file.mediaInfo
-    return Boolean(first && current && first.container === current.container && first.videoCodec === current.videoCodec && first.width === current.width && first.height === current.height && first.frameRate === current.frameRate && first.audioCodec === current.audioCodec && first.audioChannels === current.audioChannels)
-  })
-  const runMerge = async (mode: 'copy' | 'transcode') => {
-    try {
-      if (mergeFiles.length < 2) throw new Error('请添加至少两个视频文件')
-      if (mode === 'copy' && !compatible) throw new Error('文件参数不一致，不能无损合并')
-      await window.avault.startToolMerge(mergeFiles.map((file) => file.path), outputName, mode, encodeOptions())
-      notify('已加入合并任务队列')
-    } catch (error) { notify(error instanceof Error ? error.message : String(error), true) }
-  }
-  const runTranscode = async () => {
-    try {
-      if (!transcodeFiles.length) throw new Error('请先添加视频文件')
-      await window.avault.startToolTranscode(transcodeFiles.map((file) => file.path), encodeOptions())
-      notify(`已加入 ${transcodeFiles.length} 个转码任务`)
-    } catch (error) { notify(error instanceof Error ? error.message : String(error), true) }
-  }
+  const choose = async () => { const targetTab = tab; addFiles(targetTab, await window.avault.chooseToolFiles()) }
+  const drop = async (event: React.DragEvent) => { event.preventDefault(); const targetTab = tab; addFiles(targetTab, await window.avault.inspectToolFiles(Array.from(event.dataTransfer.files).map((file) => window.avault.getDroppedFilePath(file)))) }
+  const reorder = (index: number, offset: -1 | 1) => setSession((current) => { const target = index + offset; if (target < 0 || target >= current.mergeFiles.length) return current; const next = [...current.mergeFiles]; [next[index], next[target]] = [next[target], next[index]]; return { ...current, mergeFiles: next } })
+  const compatible = mergeFiles.length < 2 || mergeFiles.every((file) => { const first = mergeFiles[0].mediaInfo; const current = file.mediaInfo; return Boolean(first && current && first.container === current.container && first.videoCodec === current.videoCodec && first.width === current.width && first.height === current.height && first.frameRate === current.frameRate && first.audioCodec === current.audioCodec && first.audioChannels === current.audioChannels) })
+  const runMerge = async (mode: 'copy' | 'transcode') => { try { if (mergeFiles.length < 2) throw new Error('请添加至少两个视频文件'); if (mode === 'copy' && !compatible) throw new Error('文件参数不一致，不能无损合并'); await window.avault.startToolMerge(mergeFiles.map((file) => file.path), outputName, mode, encodeOptions()); notify('已加入合并任务队列') } catch (error) { notify(error instanceof Error ? error.message : String(error), true) } }
+  const runTranscode = async () => { try { if (!transcodeFiles.length) throw new Error('请先添加视频文件'); await window.avault.startToolTranscode(transcodeFiles.map((file) => file.path), encodeOptions()); notify(`已加入 ${transcodeFiles.length} 个转码任务`) } catch (error) { notify(error instanceof Error ? error.message : String(error), true) } }
+  const startSeconds = parseCutTime(cutStart); const endSeconds = parseCutTime(cutEnd); const cutDuration = cutFile?.mediaInfo?.durationSeconds ?? null
+  const cutValid = Boolean(cutFile && startSeconds !== null && endSeconds !== null && startSeconds < endSeconds && (cutDuration === null || endSeconds <= cutDuration))
+  const runCut = async () => { try { if (!cutFile || startSeconds === null || endSeconds === null || !cutValid) throw new Error('请填写视频范围内的开始与结束时间'); await window.avault.startToolCut(cutFile.path, startSeconds, endSeconds, cutMode, cutMode === 'transcode' ? encodeOptions() : null); notify(cutMode === 'copy' ? '已加入快速无损剪切任务' : '已加入精确剪切任务') } catch (error) { notify(error instanceof Error ? error.message : String(error), true) } }
   const probe = probeFiles.find((file) => file.path === probePath) ?? probeFiles[0] ?? null
-  const probeRows = useMemo(() => {
-    const info = probe?.mediaInfo
-    return !info ? [] : [['容器', info.container ?? '未知'], ['视频编码', info.videoCodec?.toUpperCase() ?? '未知'], ['编码器', info.videoEncoder ?? '未知'], ['分辨率', info.width && info.height ? `${info.width} × ${info.height}` : '未知'], ['帧率', info.frameRate ? `${info.frameRate} fps` : '未知'], ['视频码率', info.videoBitrate ? `${Math.round(info.videoBitrate / 1000)} kbps` : '未知'], ['像素格式', info.pixelFormat ?? '未知'], ['HDR', info.hdr ? '是' : '否'], ['音频编码', info.audioCodec?.toUpperCase() ?? '无'], ['音频声道', info.audioChannels ? `${info.audioChannels} 声道` : '未知']]
-  }, [probe])
-  return <div className="toolbox-workbench"><header className="tool-header"><div><h1>工具箱</h1><p>三个功能的文件互不共享，不写入媒体库。</p></div><Badge>FFprobe + FFmpeg</Badge></header><div className="tool-tabs"><Button size="sm" variant={tab === 'merge' ? 'default' : 'ghost'} onClick={() => update({ tab: 'merge' })}>合并视频</Button><Button size="sm" variant={tab === 'transcode' ? 'default' : 'ghost'} onClick={() => update({ tab: 'transcode' })}>转码视频</Button><Button size="sm" variant={tab === 'probe' ? 'default' : 'ghost'} onClick={() => update({ tab: 'probe' })}>媒体检测</Button></div><div onDragOver={(event) => event.preventDefault()} onDrop={drop} className="tool-addbar"><span><FileVideo2 /> 拖入文件到当前功能</span><span className="tool-addbar-hint">{tab === 'merge' ? '只加入合并列表' : tab === 'transcode' ? '只加入转码列表' : '只加入检测列表'}</span><Button size="sm" variant="outline" onClick={choose}><Plus /> 选择文件</Button></div><div className="tool-columns"><section className="tool-files"><div className="tool-panel-title"><div><h2>{tab === 'merge' ? '合并顺序' : tab === 'transcode' ? '待转码文件' : '已检测文件'}</h2><p>{tab === 'merge' ? '使用箭头调整最终合并顺序。' : tab === 'probe' ? '选择文件查看完整媒体参数。' : '每个文件都会输出到自身同级目录。'}</p></div><Badge>{files.length} 个</Badge></div><div className="tool-file-list">{files.map((file, index) => <div key={file.path} onClick={() => tab === 'probe' && update({ probePath: file.path })} className={cn('tool-file-row', tab === 'probe' && probe?.path === file.path && 'selected')}><span className="tool-file-index">{tab === 'merge' ? index + 1 : ''}</span><FileVideo2 /><span className="tool-file-name"><b>{file.name}</b><small>{formatBytes(file.size)} · {file.mediaInfo?.videoCodec?.toUpperCase() ?? '未检测'} · {file.mediaInfo?.width ?? '?'}×{file.mediaInfo?.height ?? '?'}</small></span>{tab === 'merge' && <><button disabled={index === 0} onClick={() => reorder(index, -1)}><ArrowUp /></button><button disabled={index === mergeFiles.length - 1} onClick={() => reorder(index, 1)}><ArrowDown /></button></>}<button onClick={() => setFiles(tab, (current) => current.filter((item) => item.path !== file.path))}><X /></button></div>)}{!files.length && <div className="tool-file-empty">当前功能尚未添加文件</div>}</div></section><section className="tool-settings">{tab === 'probe' ? <><div className="tool-panel-title"><div><h2>媒体参数</h2><p className="truncate">{probe?.name ?? '选择检测文件'}</p></div></div><div className="tool-probe">{probeRows.map(([label, value]) => <div key={label}><span>{label}</span><b>{value}</b></div>)}{!probe && <p>拖入文件后会自动执行 FFprobe 检测。</p>}</div></> : <><div className="tool-panel-title"><div><h2>{tab === 'merge' ? '合并参数' : '转码参数'}</h2><p>NVENC VBR-CQ · 默认保持原始分辨率和帧率</p></div></div>{tab === 'merge' && <><label>输出文件名<Input value={outputName} onChange={(event) => update({ outputName: event.target.value })} /></label><div className={cn('tool-compat', compatible ? 'ok' : 'warning')}>{compatible ? '参数一致：可无损合并。' : '参数不一致：请使用转码合并。'}</div></>}<div className="tool-form-grid"><label>编码<Select value={codec} onValueChange={(value) => update({ codec: value as ToolEncodeOptions['codec'] })}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectItem value="hevc">H.265 / HEVC</SelectItem><SelectItem value="h264">H.264</SelectItem></SelectContent></Select></label><label>分辨率<Select value={height} onValueChange={(value) => update({ height: value })}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectItem value="keep">保持原分辨率</SelectItem><SelectItem value="720">最高 720p</SelectItem><SelectItem value="1080">最高 1080p</SelectItem></SelectContent></Select></label><label>帧率<Select value={frameRate} onValueChange={(value) => update({ frameRate: value })}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectItem value="keep">保持原帧率</SelectItem><SelectItem value="24000/1001">23.976 fps</SelectItem><SelectItem value="24">24 fps</SelectItem><SelectItem value="25">25 fps</SelectItem><SelectItem value="30000/1001">29.97 fps</SelectItem><SelectItem value="30">30 fps</SelectItem><SelectItem value="50">50 fps</SelectItem><SelectItem value="60000/1001">59.94 fps</SelectItem><SelectItem value="60">60 fps</SelectItem></SelectContent></Select></label><label><span className="tool-label-with-help">质量 CQ <span className="tool-help" data-tooltip="CQ 数值越小，画质越高、文件越大；数值越大，画质越低、文件越小。HEVC 一般推荐 23。"><CircleHelp /></span></span><Input value={cq} onChange={(event) => update({ cq: event.target.value })} inputMode="numeric" /></label><label className="span-2">最高码率（可选）<Input value={maxBitrate} onChange={(event) => update({ maxBitrate: event.target.value })} placeholder="留空则不限制峰值" inputMode="numeric" /></label></div><p className="tool-form-note">填写最高码率可限制手机播放时的带宽峰值；留空时由 NVENC 按 CQ 自动分配码率。</p>{tab === 'merge' ? <div className="tool-actions"><Button disabled={mergeFiles.length < 2 || !compatible} onClick={() => runMerge('copy')}>无损合并</Button><Button variant="outline" disabled={mergeFiles.length < 2 || !snapshot.settings.ffmpeg.nvencAvailable} onClick={() => runMerge('transcode')}>转码合并</Button></div> : <Button className="tool-primary" disabled={!transcodeFiles.length || !snapshot.settings.ffmpeg.nvencAvailable} onClick={runTranscode}>加入转码队列</Button>}</>}</section><section className="tool-tasks"><div className="tool-panel-title"><div><h2>任务</h2><p>请在左下角任务抽屉查看全局进度。</p></div></div><div className="tool-empty-task">任务会在这里和全局抽屉同步显示</div></section></div></div>
+  const probeRows = useMemo(() => { const info = probe?.mediaInfo; return !info ? [] : [['容器', info.container ?? '未知'], ['视频编码', info.videoCodec?.toUpperCase() ?? '未知'], ['编码器', info.videoEncoder ?? '未知'], ['分辨率', info.width && info.height ? `${info.width} × ${info.height}` : '未知'], ['帧率', info.frameRate ? `${info.frameRate} fps` : '未知'], ['视频码率', info.videoBitrate ? `${Math.round(info.videoBitrate / 1000)} kbps` : '未知'], ['像素格式', info.pixelFormat ?? '未知'], ['HDR', info.hdr ? '是' : '否'], ['音频编码', info.audioCodec?.toUpperCase() ?? '无'], ['音频声道', info.audioChannels ? `${info.audioChannels} 声道` : '未知']] }, [probe])
+  const labels = { merge: ['合并顺序', '使用箭头调整最终合并顺序。'], transcode: ['待转码文件', '每个文件都会输出到自身同级目录。'], cut: ['待剪切文件', '只保留一个文件；拖入新文件会替换当前选择。'], probe: ['已检测文件', '选择文件查看完整媒体参数。'] } as const
+  return <div className="toolbox-workbench"><header className="tool-header"><div><h1>工具箱</h1><p>四个功能的文件互不共享，不写入媒体库。</p></div><Badge>FFprobe + FFmpeg</Badge></header><div className="tool-tabs"><Button size="sm" variant={tab === 'merge' ? 'default' : 'ghost'} onClick={() => update({ tab: 'merge' })}>合并视频</Button><Button size="sm" variant={tab === 'transcode' ? 'default' : 'ghost'} onClick={() => update({ tab: 'transcode' })}>转码视频</Button><Button size="sm" variant={tab === 'cut' ? 'default' : 'ghost'} onClick={() => update({ tab: 'cut' })}>视频剪切</Button><Button size="sm" variant={tab === 'probe' ? 'default' : 'ghost'} onClick={() => update({ tab: 'probe' })}>媒体检测</Button></div><div onDragOver={(event) => event.preventDefault()} onDrop={drop} className="tool-addbar"><span><FileVideo2 /> 拖入文件到当前功能</span><span className="tool-addbar-hint">{tab === 'merge' ? '只加入合并列表' : tab === 'transcode' ? '只加入转码列表' : tab === 'cut' ? '替换当前剪切文件' : '只加入检测列表'}</span><Button size="sm" variant="outline" onClick={choose}><Plus /> 选择文件</Button></div><div className="tool-columns"><section className="tool-files"><div className="tool-panel-title"><div><h2>{labels[tab][0]}</h2><p>{labels[tab][1]}</p></div><Badge>{files.length} 个</Badge></div><div className="tool-file-list">{files.map((file, index) => <div key={file.path} onClick={() => tab === 'probe' && update({ probePath: file.path })} className={cn('tool-file-row', tab === 'probe' && probe?.path === file.path && 'selected')}><span className="tool-file-index">{tab === 'merge' ? index + 1 : ''}</span><FileVideo2 /><span className="tool-file-name"><b>{file.name}</b><small>{formatBytes(file.size)} · {file.mediaInfo?.videoCodec?.toUpperCase() ?? '未检测'} · {file.mediaInfo?.width ?? '?'}×{file.mediaInfo?.height ?? '?'}</small></span>{tab === 'merge' && <><button disabled={index === 0} onClick={() => reorder(index, -1)}><ArrowUp /></button><button disabled={index === mergeFiles.length - 1} onClick={() => reorder(index, 1)}><ArrowDown /></button></>}<button onClick={() => setSession((current) => tab === 'cut' ? { ...current, cutFile: null } : tab === 'merge' ? { ...current, mergeFiles: current.mergeFiles.filter((item) => item.path !== file.path) } : tab === 'transcode' ? { ...current, transcodeFiles: current.transcodeFiles.filter((item) => item.path !== file.path) } : { ...current, probeFiles: current.probeFiles.filter((item) => item.path !== file.path) })}><X /></button></div>)}{!files.length && <div className="tool-file-empty">当前功能尚未添加文件</div>}</div></section><section className="tool-settings">{tab === 'probe' ? <><div className="tool-panel-title"><div><h2>媒体参数</h2><p className="truncate">{probe?.name ?? '选择检测文件'}</p></div></div><div className="tool-probe">{probeRows.map(([label, value]) => <div key={label}><span>{label}</span><b>{value}</b></div>)}{!probe && <p>拖入文件后会自动执行 FFprobe 检测。</p>}</div></> : tab === 'cut' ? <><div className="tool-panel-title"><div><h2>剪切参数</h2><p>输出自动写入源文件同级目录，不覆盖原文件。</p></div></div>{cutFile && <div className="tool-cut-source"><Scissors /><span>{cutFile.name}</span><small>总时长 {formatCutTime(cutDuration)}</small></div>}<div className="tool-form-grid"><label>开始时间<Input value={cutStart} onChange={(event) => update({ cutStart: event.target.value })} onBlur={() => startSeconds !== null && update({ cutStart: formatCutTime(startSeconds) })} placeholder="00:00:00" /></label><label>结束时间<Input value={cutEnd} onChange={(event) => update({ cutEnd: event.target.value })} onBlur={() => endSeconds !== null && update({ cutEnd: formatCutTime(endSeconds) })} placeholder="00:00:00" /></label></div><p className={cn('tool-form-note', !cutValid && cutFile && 'text-amber-300')}>{cutFile ? cutValid ? `将输出 ${formatCutTime((endSeconds ?? 0) - (startSeconds ?? 0))} 的片段。` : '开始时间必须早于结束时间，且结束时间不能超过视频总时长。' : '支持 HH:MM:SS、MM:SS 或纯秒数。'}</p><div className="tool-cut-mode"><Button size="sm" variant={cutMode === 'copy' ? 'default' : 'outline'} onClick={() => update({ cutMode: 'copy' })}>快速无损</Button><Button size="sm" variant={cutMode === 'transcode' ? 'default' : 'outline'} onClick={() => update({ cutMode: 'transcode' })} disabled={!snapshot.settings.ffmpeg.nvencAvailable}>精确剪切</Button></div><p className="tool-form-note">{cutMode === 'copy' ? '快速无损不重编码，但开始位置会落在相邻关键帧，可能略有偏移。' : '精确剪切会使用 NVIDIA 编码器重新编码，边界准确。'}</p>{cutMode === 'transcode' && <ToolEncodeFields session={session} update={update} />}<Button className="tool-primary" disabled={!cutValid || (cutMode === 'transcode' && !snapshot.settings.ffmpeg.nvencAvailable)} onClick={runCut}>{cutMode === 'copy' ? '加入无损剪切队列' : '加入精确剪切队列'}</Button></> : <><div className="tool-panel-title"><div><h2>{tab === 'merge' ? '合并参数' : '转码参数'}</h2><p>NVENC VBR-CQ · 默认保持原始分辨率和帧率</p></div></div>{tab === 'merge' && <><label>输出文件名<Input value={outputName} onChange={(event) => update({ outputName: event.target.value })} /></label><div className={cn('tool-compat', compatible ? 'ok' : 'warning')}>{compatible ? '参数一致：可无损合并。' : '参数不一致：请使用转码合并。'}</div></>}<ToolEncodeFields session={session} update={update} />{tab === 'merge' ? <div className="tool-actions"><Button disabled={mergeFiles.length < 2 || !compatible} onClick={() => runMerge('copy')}>无损合并</Button><Button variant="outline" disabled={mergeFiles.length < 2 || !snapshot.settings.ffmpeg.nvencAvailable} onClick={() => runMerge('transcode')}>转码合并</Button></div> : <Button className="tool-primary" disabled={!transcodeFiles.length || !snapshot.settings.ffmpeg.nvencAvailable} onClick={runTranscode}>加入转码队列</Button>}</>}</section></div></div>
 }
