@@ -33,3 +33,9 @@ AVault-data/
 /electron/data/
 android-*.png
 android/*.png
+
+# iOS local Xcode state and build output
+iOS/build/
+iOS/DerivedData/
+xcuserdata/
+*.xcuserstate

@@ -10,6 +10,7 @@ Windows 桌面端与 Android 局域网客户端的首个可用版本均已完成
 
 - `electron/`：Electron、React、TypeScript 桌面端，同时提供带令牌鉴权的局域网服务。
 - `android/`：Kotlin、Jetpack Compose、Media3 Android 客户端。
+- `iOS/`：SwiftUI、AVKit iOS 客户端（iOS 17+），构建和功能范围见 [`iOS/README.md`](iOS/README.md)。
 - `javdb-copy-title-and-metadata.user.js`：用于复制 JavDB 影片资料 HTML 的 Tampermonkey 脚本。
 - `REQUIREMENTS.md`：桌面端实现基线。
 - `android/REQUIREMENTS.md`：Android 端需求与验收基线。
